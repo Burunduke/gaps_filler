@@ -23,13 +23,327 @@
 """
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
 from qgis.PyQt.QtGui import QIcon
-from qgis.PyQt.QtWidgets import QAction
+from qgis.PyQt.QtWidgets import QAction, QMessageBox
 
 # Initialize Qt resources from file resources.py
 from .resources import *
 # Import the code for the dialog
 from .gaps_filler_dialog import GapsFillerDialog
 import os.path
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python re-implementation of GDAL's GDALFillNodata.
+#
+# Same observable behaviour as ``gdal.FillNodata``: per-pixel inverse-distance
+# weighting from the four nearest originally-valid pixels, one per spatial
+# quadrant (NW, NE, SW, SE), followed by an optional 3x3 masked-mean
+# smoothing pass repeated N times. GDAL is intentionally NOT used here — the
+# host plugin is free to call GDAL only for raster I/O.
+#
+# Phases:
+#   1. forward (top-down) sweep   -> NW & NE candidates per pixel
+#   2. backward (bottom-up) sweep -> SW & SE candidates per pixel
+#   3. IDW combine                -> fill nodata pixels using 1/d^2 weights
+#   4. smoothing                  -> N x 3x3 masked mean over filled pixels
+#
+# See ``fillnodata_spec.md`` for the full specification.
+# ---------------------------------------------------------------------------
+
+
+def _box3_sum(a):
+    """3x3 box sum with zero padding (border-clipped, like GDAL)."""
+    H, W = a.shape
+    p = np.zeros((H + 2, W + 2), dtype=a.dtype)
+    p[1:-1, 1:-1] = a
+    return (
+        p[0:H,     0:W]     + p[0:H,     1:W + 1] + p[0:H,     2:W + 2] +
+        p[1:H + 1, 0:W]     + p[1:H + 1, 1:W + 1] + p[1:H + 1, 2:W + 2] +
+        p[2:H + 2, 0:W]     + p[2:H + 2, 1:W + 1] + p[2:H + 2, 2:W + 2]
+    )
+
+
+def _scan_quadrants(result, mask_orig, top_down):
+    """One full sweep of the raster collecting two candidates per pixel.
+
+    Returns (cand_W, dist_W, cand_E, dist_E) for the relevant half-plane:
+      * top_down=True  -> NW (West side) & NE (East side)
+      * top_down=False -> SW             & SE
+
+    Strategy per row:
+      * Two horizontal scans (left-to-right, right-to-left) give the nearest
+        valid pixel within the current row from each side.
+      * Persistent per-column trackers carry the best candidate seen in
+        earlier rows. Updating each tracker every row with the better of
+        (row scan vs tracker) propagates candidates diagonally — this is
+        what turns four directional searches into four quadrant searches.
+    """
+    H, W = result.shape
+    NEG = -1.0e18      # sentinel for "no candidate yet" coords
+    POS = 1.0e18
+
+    cand_W = np.full((H, W), np.nan, dtype=np.float64)
+    cand_E = np.full((H, W), np.nan, dtype=np.float64)
+    dist_W = np.full((H, W), np.inf, dtype=np.float64)
+    dist_E = np.full((H, W), np.inf, dtype=np.float64)
+
+    # Per-column "other half-plane" trackers.
+    oth_W_val = np.full(W, np.nan, dtype=np.float64)
+    oth_W_xo = np.full(W, NEG, dtype=np.float64)
+    oth_W_yo = np.full(W, NEG, dtype=np.float64)
+    oth_E_val = np.full(W, np.nan, dtype=np.float64)
+    oth_E_xo = np.full(W, POS, dtype=np.float64)
+    oth_E_yo = np.full(W, NEG, dtype=np.float64)
+
+    cols = np.arange(W, dtype=np.float64)
+    row_order = range(H) if top_down else range(H - 1, -1, -1)
+
+    for y in row_order:
+        mrow = mask_orig[y]
+        vrow = result[y]
+        # Sanitise possibly-NaN values at masked positions.
+        vrow_safe = np.where(mrow, vrow, 0.0)
+        yf = float(y)
+
+        # --- West scan: column of latest valid pixel at col <= x.
+        idx_w = np.where(mrow, cols, -1.0)
+        west_xo = np.maximum.accumulate(idx_w)
+        no_west = west_xo < 0
+        safe_w = np.where(no_west, 0, west_xo).astype(np.int64)
+        west_val = vrow_safe[safe_w]
+        west_val = np.where(no_west, np.nan, west_val)
+        west_xo = np.where(no_west, NEG, west_xo)
+        west_yo = np.where(no_west, NEG, yf)
+
+        # --- East scan: column of nearest valid pixel at col >= x.
+        idx_e = np.where(mrow, cols, float(W))
+        east_xo = np.minimum.accumulate(idx_e[::-1])[::-1]
+        no_east = east_xo >= W
+        safe_e = np.where(no_east, 0, east_xo).astype(np.int64)
+        east_val = vrow_safe[safe_e]
+        east_val = np.where(no_east, np.nan, east_val)
+        east_xo = np.where(no_east, POS, east_xo)
+        east_yo = np.where(no_east, NEG, yf)
+
+        # --- West side: pick row scan vs persistent tracker, keep the closer.
+        d_row = np.hypot(cols - west_xo, yf - west_yo)
+        d_oth = np.hypot(cols - oth_W_xo, yf - oth_W_yo)
+        take_row = d_row <= d_oth
+        oth_W_val = np.where(take_row, west_val, oth_W_val)
+        oth_W_xo = np.where(take_row, west_xo, oth_W_xo)
+        oth_W_yo = np.where(take_row, west_yo, oth_W_yo)
+        cand_W[y] = oth_W_val
+        dist_W[y] = np.where(take_row, d_row, d_oth)
+
+        # --- East side.
+        d_row = np.hypot(cols - east_xo, yf - east_yo)
+        d_oth = np.hypot(cols - oth_E_xo, yf - oth_E_yo)
+        take_row = d_row <= d_oth
+        oth_E_val = np.where(take_row, east_val, oth_E_val)
+        oth_E_xo = np.where(take_row, east_xo, oth_E_xo)
+        oth_E_yo = np.where(take_row, east_yo, oth_E_yo)
+        cand_E[y] = oth_E_val
+        dist_E[y] = np.where(take_row, d_row, d_oth)
+
+    return cand_W, dist_W, cand_E, dist_E
+
+
+def _smooth_step(result, mask_orig):
+    """One masked-mean 3x3 smoothing iteration (out-of-place).
+
+    * Only originally-nodata pixels are updated.
+    * The mean uses only currently-finite neighbours.
+    * Pixels with zero valid neighbours are left unchanged.
+    """
+    valid = ~np.isnan(result)
+    weights = valid.astype(np.float64)
+    values = np.where(valid, result, 0.0)
+    sum_v = _box3_sum(values)
+    sum_w = _box3_sum(weights)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        avg = np.where(sum_w > 0, sum_v / sum_w, result)
+    return np.where(mask_orig, result, avg)
+
+
+def fill_nodata(band,
+                mask=None,
+                max_search_dist=100.0,
+                smoothing_iterations=0,
+                nodata=None,
+                interpolation="INV_DIST"):
+    """Pure-numpy equivalent of ``gdal.FillNodata``.
+
+    Parameters
+    ----------
+    band : np.ndarray
+        2-D input raster (any numeric dtype).
+    mask : np.ndarray or None
+        Same shape as ``band``. Truthy = valid. If ``None``, derived from
+        ``nodata`` (NaN-aware).
+    max_search_dist : float
+        Max candidate distance in pixels (inclusive). ``<= 0`` disables fill.
+    smoothing_iterations : int
+        Number of 3x3 smoothing passes after fill.
+    nodata : numeric or None
+        Used to derive the mask when ``mask is None`` and as the sentinel
+        for pixels that remain unfilled.
+    interpolation : {"INV_DIST", "NEAREST"}
+
+    Returns
+    -------
+    np.ndarray
+        Filled raster, same shape and dtype as ``band``.
+    """
+    band = np.asarray(band)
+    if band.ndim != 2:
+        raise ValueError("fill_nodata expects a 2-D array")
+
+    src_dtype = band.dtype
+    H, W = band.shape
+
+    # ---- 4.0 Build the original mask (frozen for the whole algorithm). ----
+    if mask is None:
+        if nodata is None:
+            mask_orig = ~np.isnan(band.astype(np.float64))
+        else:
+            if np.isnan(nodata):
+                mask_orig = ~np.isnan(band.astype(np.float64))
+            else:
+                mask_orig = band != nodata
+                # NaN cells (if any in a float band) are always invalid.
+                if np.issubdtype(src_dtype, np.floating):
+                    mask_orig &= ~np.isnan(band)
+    else:
+        mask_orig = np.asarray(mask).astype(bool)
+        if mask_orig.shape != band.shape:
+            raise ValueError("mask shape must match band shape")
+
+    # Working copy in float64; nodata cells become NaN so smoothing can
+    # detect "still missing" easily.
+    result = band.astype(np.float64, copy=True)
+    result[~mask_orig] = np.nan
+
+    # ---- Edge cases ------------------------------------------------------
+    # No nodata at all: nothing to do.
+    if mask_orig.all():
+        return band.copy()
+    # Empty mask (no valid donors): nothing can be filled or smoothed.
+    if not mask_orig.any():
+        return band.copy()
+
+    # ---- 4.1 + 4.2 Quadrant scans ---------------------------------------
+    # Skip scans entirely if the user disabled the IDW fill.
+    if max_search_dist > 0:
+        cand_NW, dist_NW, cand_NE, dist_NE = _scan_quadrants(
+            result, mask_orig, top_down=True)
+        cand_SW, dist_SW, cand_SE, dist_SE = _scan_quadrants(
+            result, mask_orig, top_down=False)
+
+        cands = np.stack([cand_NW, cand_NE, cand_SW, cand_SE], axis=0)
+        dists = np.stack([dist_NW, dist_NE, dist_SW, dist_SE], axis=0)
+
+        # Keep only finite candidates within the search radius.
+        in_range = (dists <= max_search_dist) & np.isfinite(cands)
+
+        # ---- 4.3 IDW combine --------------------------------------------
+        if interpolation.upper() == "NEAREST":
+            big = np.where(in_range, dists, np.inf)
+            best = np.argmin(big, axis=0)
+            yy, xx = np.indices((H, W))
+            picked_d = big[best, yy, xx]
+            picked_v = cands[best, yy, xx]
+            filled = np.where(np.isfinite(picked_d), picked_v, np.nan)
+        else:
+            # INV_DIST: weight = 1 / d^2; donors at d=0 are impossible since
+            # only nodata pixels are filled and donors are always different.
+            d2 = dists * dists
+            ok = in_range & (d2 > 0)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                w = np.where(ok, 1.0 / np.where(ok, d2, 1.0), 0.0)
+            v = np.where(ok & np.isfinite(cands), cands, 0.0)
+            num = (v * w).sum(axis=0)
+            den = w.sum(axis=0)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                filled = np.where(den > 0, num / den, np.nan)
+
+        # Update only originally-nodata pixels.
+        result = np.where(mask_orig, result, filled)
+
+    # ---- 4.4 Smoothing --------------------------------------------------
+    for _ in range(int(smoothing_iterations)):
+        result = _smooth_step(result, mask_orig)
+
+    # ---- Cast back to source dtype --------------------------------------
+    if np.issubdtype(src_dtype, np.integer):
+        # Integer band: round, replace remaining NaN with nodata (or 0).
+        fill_value = 0 if nodata is None else nodata
+        out = np.where(np.isnan(result), float(fill_value), result)
+        out = np.rint(out).astype(src_dtype)
+    else:
+        if nodata is not None and not (isinstance(nodata, float) and np.isnan(nodata)):
+            # Replace remaining NaN with the requested nodata sentinel.
+            result = np.where(np.isnan(result), float(nodata), result)
+        out = result.astype(src_dtype)
+    return out
+
+
+def fill_nodata_file(input_path, output_path, band_number=1,
+                     mask_path=None, max_search_dist=10.0,
+                     smoothing_iterations=0):
+    """Read one band of a raster, fill its nodata, write a GeoTIFF copy.
+
+    Mirrors QGIS's "Fill nodata" tool: only the chosen band is processed
+    (other bands are copied as-is to keep the output a valid raster). If
+    ``mask_path`` is given, the first band of that raster is used as the
+    validity mask (non-zero = valid pixel); otherwise the band's own
+    nodata value is used. Geotransform, projection and nodata are
+    preserved by ``CreateCopy``.
+
+    GDAL is used only for I/O — the algorithm runs in ``fill_nodata``.
+    """
+    from osgeo import gdal  # local import: keep plugin import-time light
+    src = gdal.Open(input_path, gdal.GA_ReadOnly)
+    if src is None:
+        raise IOError("Cannot open {}".format(input_path))
+    if band_number < 1 or band_number > src.RasterCount:
+        raise ValueError("band_number {} out of range (raster has {} bands)"
+                         .format(band_number, src.RasterCount))
+
+    # Optional external validity mask: read first band, non-zero = valid.
+    mask = None
+    if mask_path:
+        msrc = gdal.Open(mask_path, gdal.GA_ReadOnly)
+        if msrc is None:
+            raise IOError("Cannot open mask {}".format(mask_path))
+        marr = msrc.GetRasterBand(1).ReadAsArray()
+        msrc = None
+        if marr.shape != (src.RasterYSize, src.RasterXSize):
+            raise ValueError("mask shape {} does not match raster {}"
+                             .format(marr.shape,
+                                     (src.RasterYSize, src.RasterXSize)))
+        mask = marr != 0
+
+    driver = gdal.GetDriverByName("GTiff")
+    dst = driver.CreateCopy(output_path, src, strict=0)
+
+    in_band = src.GetRasterBand(band_number)
+    arr = in_band.ReadAsArray()
+    nodata = in_band.GetNoDataValue()
+    filled = fill_nodata(
+        arr,
+        mask=mask,
+        max_search_dist=max_search_dist,
+        smoothing_iterations=smoothing_iterations,
+        nodata=nodata,
+    )
+    dst.GetRasterBand(band_number).WriteArray(filled)
+    if nodata is not None:
+        dst.GetRasterBand(band_number).SetNoDataValue(nodata)
+    dst.FlushCache()
+    dst = None
+    src = None
 
 
 class GapsFiller:
@@ -181,20 +495,52 @@ class GapsFiller:
 
 
     def run(self):
-        """Run method that performs all the real work"""
+        """Show the dialog and run a fill on the chosen layer/band."""
+        # Recreate every run so layer combos pick up the current project.
+        self.dlg = GapsFillerDialog(self.iface.mainWindow())
 
-        # Create the dialog with elements (after translation) and keep reference
-        # Only create GUI ONCE in callback, so that it will only load when the plugin is started
-        if self.first_start == True:
-            self.first_start = False
-            self.dlg = GapsFillerDialog()
+        if not self.dlg.exec_():
+            return  # user cancelled
 
-        # show the dialog
-        self.dlg.show()
-        # Run the dialog event loop
-        result = self.dlg.exec_()
-        # See if OK was pressed
-        if result:
-            # Do something useful here - delete the line containing pass and
-            # substitute with your code.
-            pass
+        # ---- read params from the dialog ----------------------------------
+        in_layer = self.dlg.input_combo.currentLayer()
+        if in_layer is None:
+            QMessageBox.warning(self.dlg, "Fill nodata",
+                                "Please choose an input raster layer.")
+            return
+        in_path = in_layer.source()
+
+        out_path = self.dlg.output_widget.filePath().strip()
+        if not out_path:
+            QMessageBox.warning(self.dlg, "Fill nodata",
+                                "Please choose an output path.")
+            return
+
+        band_number = self.dlg.band_combo.currentBand()
+        if band_number is None or band_number < 1:
+            band_number = 1
+
+        max_dist = self.dlg.dist_spin.value()
+        smoothing = self.dlg.smooth_spin.value()
+
+        mask_layer = self.dlg.mask_combo.currentLayer()
+        mask_path = mask_layer.source() if mask_layer is not None else None
+
+        # ---- run the fill --------------------------------------------------
+        try:
+            fill_nodata_file(
+                in_path, out_path,
+                band_number=band_number,
+                mask_path=mask_path,
+                max_search_dist=float(max_dist),
+                smoothing_iterations=int(smoothing),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self.iface.mainWindow(), "Fill nodata",
+                                 "Failed: {}".format(exc))
+            return
+
+        # ---- success: load result and notify ------------------------------
+        self.iface.addRasterLayer(out_path, os.path.basename(out_path))
+        self.iface.messageBar().pushSuccess(
+            "Fill nodata", "Output written to {}".format(out_path))
