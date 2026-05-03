@@ -5,8 +5,8 @@
 [general]
 name=Hyperspectral gaps filler
 qgisMinimumVersion=3.0
-description=This plugin fills the gaps in hyperspectral photos to make an ortophoto
-version=0.1
+description=Processing algorithm that fills NoData gaps in hyperspectral rasters to help build an orthophoto.
+version=0.2
 author=Duke
 email=st087204@student.spbu.ru
 
@@ -18,7 +18,7 @@ repository=http://repo
 
 # Recommended items:
 
-hasProcessingProvider=no
+hasProcessingProvider=yes
 # Uncomment the following line and add your changelog:
 # changelog=
 

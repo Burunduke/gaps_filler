@@ -146,3 +146,170 @@ The plugin now runs end-to-end from QGIS.
   `mask_path` is given, its first band is read and `!= 0` is used as the
   validity mask; otherwise the band's own nodata value drives the mask
   inside `fill_nodata`.
+
+## Processing algorithm refactor plan
+
+> **Why the change?** The previous "Dialog redesign plan" tried to hand-build a Qt dialog that *looks* like the GDAL Fill nodata dialog (tabs, log, progress bar, console-call preview, batch button stub, etc.). That is a lot of UI code to maintain — and to get wrong. QGIS already ships a framework that renders exactly that dialog automatically, given a parameter list: the **Processing framework**. By exposing our gap-filler as a [`QgsProcessingAlgorithm`](https://api.qgis.org/api/classQgsProcessingAlgorithm.html) registered through a [`QgsProcessingProvider`](https://api.qgis.org/api/classQgsProcessingProvider.html), we get — for free — a dialog visually identical to GDAL Fill nodata, plus **batch mode**, **history**, **"Run as Python command"**, model-builder integration, and a standard log/progress pane. The plan below replaces the hand-rolled dialog entirely.
+
+### 1. New file structure
+
+**Add:**
+
+| File | Purpose |
+|---|---|
+| `gaps_filler_provider.py` | Subclass of [`QgsProcessingProvider`](https://api.qgis.org/api/classQgsProcessingProvider.html). Holds the provider id (`gapsfiller`), display name ("Hyperspectral gaps filler"), icon, and a `loadAlgorithms()` that registers a single `GapsFillerAlgorithm` instance. |
+| `gaps_filler_algorithm.py` | Subclass of [`QgsProcessingAlgorithm`](https://api.qgis.org/api/classQgsProcessingAlgorithm.html). Defines parameters in `initAlgorithm()`, runs the work in `processAlgorithm()`. **No Qt UI code** — the dialog is auto-built. |
+| `fill_nodata.py` | Pure-Python module containing the existing fill logic, lifted out of [`gaps_filler.py`](gaps_filler.py). Importable from the algorithm with **zero Qt dependency** (only `numpy` + `osgeo.gdal`). |
+
+**Remove / simplify:**
+
+| File | Action |
+|---|---|
+| [`gaps_filler_dialog.py`](gaps_filler_dialog.py) | **Delete.** No custom dialog any more. |
+| [`gaps_filler_dialog_base.ui`](gaps_filler_dialog_base.ui) | **Delete.** Already unused at runtime. |
+| [`gaps_filler.py`](gaps_filler.py) | Strip down to the QGIS plugin entry class only: `__init__`, `initGui`, `unload`. Remove the `QAction`, the toolbar/menu wiring, and the dialog import. **Move** `fill_nodata`, `fill_nodata_file`, `_scan_quadrants`, `_smooth_step`, `_box3_sum` into the new `fill_nodata.py`. (Optional in v1: keep one menu shortcut — see §4.) |
+| [`__init__.py`](__init__.py) | Unchanged — still returns `GapsFiller(iface)`. |
+
+### 2. Algorithm parameters (`initAlgorithm`)
+
+Mirror QGIS's built-in `gdal:fillnodata` one-for-one. Constants are class attributes (uppercase strings). Use `self.tr(...)` for human labels (i18n is wired up already).
+
+| Const | Qt class | Args (besides name + label) | Default | Notes |
+|---|---|---|---|---|
+| `INPUT` | `QgsProcessingParameterRasterLayer` | — | — | Source raster. |
+| `BAND` | `QgsProcessingParameterBand` | `parentLayerParameterName=self.INPUT` | `1` | Auto-populates with bands of the chosen layer. |
+| `DISTANCE` | `QgsProcessingParameterNumber` | `type=QgsProcessingParameterNumber.Integer, minValue=0` | `10` | Maximum search distance in pixels. |
+| `ITERATIONS` | `QgsProcessingParameterNumber` | `type=Integer, minValue=0` | `0` | Smoothing iterations. |
+| `MASK_LAYER` | `QgsProcessingParameterRasterLayer` | `optional=True` | `None` | Validity mask. |
+| `OUTPUT` | `QgsProcessingParameterRasterDestination` | — | — | Destination GeoTIFF (Processing handles "Save to temporary file"). |
+
+**Advanced flag.** GDAL's `fillnodata` exposes two more — *"Additional creation options"* and *"Don't use the default validity mask"* — both flagged `FlagAdvanced`. Per the brief ("only include params we'll actually use"), we **omit them in v1**: `fill_nodata_file` does not accept creation options, and the default-mask toggle is not meaningful for our pure-Python path. They can be added later by appending a `QgsProcessingParameterString` (creation opts) and `QgsProcessingParameterBoolean` (no-mask) and calling `param.setFlags(param.flags() | QgsProcessingParameterDefinition.FlagAdvanced)` before `addParameter(...)`.
+
+Algorithm metadata methods to implement: `name()` → `"fillnodata"`; `displayName()` → `"Fill nodata"`; `group()`/`groupId()` → `"Raster analysis"`/`"rasteranalysis"`; `shortHelpString()` → one paragraph mirroring [`metadata.txt`](metadata.txt) `about`; `createInstance()` → `return GapsFillerAlgorithm()`.
+
+### 3. `processAlgorithm` skeleton
+
+Read inputs, call the extracted fill function, return the output path keyed by `OUTPUT`.
+
+```text
+def processAlgorithm(self, parameters, context, feedback):
+    src_layer = self.parameterAsRasterLayer(parameters, self.INPUT, context)
+    band      = self.parameterAsInt(parameters, self.BAND, context)
+    distance  = self.parameterAsInt(parameters, self.DISTANCE, context)
+    iters     = self.parameterAsInt(parameters, self.ITERATIONS, context)
+    mask_lyr  = self.parameterAsRasterLayer(parameters, self.MASK_LAYER, context)  # may be None
+    out_path  = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
+
+    feedback.pushInfo(f"Filling band {band} of {src_layer.source()} …")
+    fill_nodata.fill_nodata_file(
+        input_path        = src_layer.source(),
+        output_path       = out_path,
+        band_number       = band,
+        mask_path         = mask_lyr.source() if mask_lyr else None,
+        max_search_dist   = distance,
+        smoothing_iterations = iters,
+        feedback          = feedback,   # NEW — see below
+    )
+    return {self.OUTPUT: out_path}
+```
+
+**Feedback wiring.** Extend `fill_nodata` / `fill_nodata_file` (in `fill_nodata.py`) with one optional argument `feedback=None` of duck type [`QgsProcessingFeedback`](https://api.qgis.org/api/classQgsProcessingFeedback.html). Inside the algorithm:
+
+- Progress: at the start of each quadrant scan / smoothing iteration call `feedback.setProgress(percent)` where `percent` is computed as `100 * step_done / total_steps` (`total_steps = 2 (forward+backward sweeps) + iterations`).
+- Logging: `feedback.pushInfo("…")` for milestones; `feedback.reportError("…", fatalError=True)` if GDAL I/O fails.
+- Cancellation: at the top of each major loop check `if feedback.isCanceled(): return` (or raise `QgsProcessingException("Canceled")` so Processing reports it cleanly).
+
+`fill_nodata.py` must NOT import anything from `qgis.PyQt` or `qgis.gui`; it only uses the `feedback` object via duck typing, so it stays unit-testable without QGIS.
+
+### 4. Provider registration (`gaps_filler.py`)
+
+Reduced to:
+
+```text
+class GapsFiller:
+    def __init__(self, iface):
+        self.iface = iface
+        self.provider = None
+
+    def initGui(self):
+        from .gaps_filler_provider import GapsFillerProvider
+        self.provider = GapsFillerProvider()
+        QgsApplication.processingRegistry().addProvider(self.provider)
+
+    def unload(self):
+        if self.provider is not None:
+            QgsApplication.processingRegistry().removeProvider(self.provider)
+            self.provider = None
+```
+
+`GapsFillerProvider`:
+
+- `id()` → `"gapsfiller"`
+- `name()` → `"Hyperspectral gaps filler"`
+- `icon()` → `QIcon(":/plugins/gaps_filler/icon.png")` (already in `resources.py`)
+- `loadAlgorithms()` → `self.addAlgorithm(GapsFillerAlgorithm())`
+
+The algorithm now appears under **Processing Toolbox → Hyperspectral gaps filler → Fill nodata** automatically. **No `QAction`, no menu/toolbar entry, no `add_action`, no `tr` boilerplate** — delete all of it from [`gaps_filler.py`](gaps_filler.py).
+
+**Optional menu shortcut (skip in v1).** If a top-level "Raster → Fill the gaps" entry is desired for discoverability, add a single `QAction` in `initGui` whose slot is:
+
+```text
+import processing
+processing.execAlgorithmDialog("gapsfiller:fillnodata", {})
+```
+
+Remove that action in `unload`. Recommendation: **don't bother in v1** — the Toolbox is the QGIS-idiomatic entry point.
+
+### 5. Where the existing fill logic lives (extraction target)
+
+Despite the brief mentioning `gaps_filler_dialog.py`, the actual numpy/GDAL code lives in [`gaps_filler.py`](gaps_filler.py). Functions to **move verbatim** into the new `fill_nodata.py`:
+
+| Function | Line (current) | Role |
+|---|---|---|
+| [`_box3_sum()`](gaps_filler.py:56) | 56 | 3×3 box sum helper. |
+| [`_scan_quadrants()`](gaps_filler.py:68) | 68 | One forward/backward IDW sweep. |
+| [`_smooth_step()`](gaps_filler.py:153) | 153 | One masked-mean smoothing pass. |
+| [`fill_nodata()`](gaps_filler.py:170) | 170 | Pure-array entry point (numpy in, numpy out). |
+| [`fill_nodata_file()`](gaps_filler.py:292) | 292 | GDAL I/O wrapper (path in, path out). Add the optional `feedback=None` parameter here and forward it to `fill_nodata`. |
+
+After extraction [`gaps_filler.py`](gaps_filler.py) keeps **only** the `GapsFiller` plugin class (~30 lines). [`gaps_filler_dialog.py`](gaps_filler_dialog.py) is deleted (it never held the fill logic — it only built the form widgets).
+
+Imports inside `fill_nodata.py`: `import numpy as np`, `from osgeo import gdal`. **Nothing else.**
+
+### 6. `metadata.txt` / `pb_tool.cfg` migration
+
+[`metadata.txt`](metadata.txt) — no schema changes; consider tweaking `description` / `about` to mention "Processing algorithm" instead of "dialog". Optionally bump `qgisMinimumVersion` to `3.14` (when `QgsProcessingParameterBand.parentLayerParameterName` and modern provider API stabilized) — `3.0` is technically too old anyway.
+
+[`pb_tool.cfg`](pb_tool.cfg:51) — update the `[files]` section:
+
+- `python_files`: replace `gaps_filler_dialog.py` with `gaps_filler_provider.py`, `gaps_filler_algorithm.py`, `fill_nodata.py`. Final value:
+  ```
+  python_files: __init__.py gaps_filler.py gaps_filler_provider.py gaps_filler_algorithm.py fill_nodata.py
+  ```
+- `main_dialog`: clear it (was `gaps_filler_dialog_base.ui`, now empty/removed).
+- `compiled_ui_files`: stays empty.
+- `resource_files`: unchanged (`resources.qrc`).
+- `extras`, `extra_dirs`, `locales`: unchanged.
+
+[`Makefile`](Makefile) — unchanged (still just `pyrcc5` for resources).
+
+### 7. Step-by-step implementation order
+
+1. **Create `fill_nodata.py`.** Cut-and-paste `_box3_sum`, `_scan_quadrants`, `_smooth_step`, `fill_nodata`, `fill_nodata_file` out of [`gaps_filler.py`](gaps_filler.py). Verify the file imports cleanly (`python -c "import fill_nodata"`) — it must not pull in PyQt/qgis.
+2. **Add `feedback` plumbing to `fill_nodata_file` and `fill_nodata`.** Optional kwarg, default `None`. Inside, guard every call: `if feedback is not None: feedback.setProgress(p)` / `feedback.pushInfo(...)`; check `feedback.isCanceled()` at the top of each sweep and each smoothing iteration; on cancel, raise `RuntimeError("canceled")` (the algorithm wrapper translates it to `QgsProcessingException`).
+3. **Create `gaps_filler_algorithm.py`.** Subclass `QgsProcessingAlgorithm`. Implement `name`, `displayName`, `group`, `groupId`, `shortHelpString`, `createInstance`, `initAlgorithm` (the 6 parameters from §2), and `processAlgorithm` (the skeleton from §3, calling `fill_nodata.fill_nodata_file`).
+4. **Create `gaps_filler_provider.py`.** Subclass `QgsProcessingProvider` per §4. Use `:/plugins/gaps_filler/icon.png` for the icon.
+5. **Slim down [`gaps_filler.py`](gaps_filler.py).** Remove every `QAction`, `add_action`, `iface.addToolBarIcon`, `iface.addPluginToMenu`, the `tr` helper, the `run()` method, the dialog import, and all the moved fill-logic functions. Keep only `GapsFiller.__init__/initGui/unload` per §4.
+6. **Delete [`gaps_filler_dialog.py`](gaps_filler_dialog.py) and [`gaps_filler_dialog_base.ui`](gaps_filler_dialog_base.ui).** Also delete `test/test_gaps_filler_dialog.py` (it imports the deleted module).
+7. **Update [`pb_tool.cfg`](pb_tool.cfg)** per §6.
+8. **Smoke-test in QGIS.** Reload plugin → open Processing Toolbox → confirm "Hyperspectral gaps filler → Fill nodata" appears → run on a small raster → verify the auto-generated dialog matches GDAL Fill nodata in look & feel, batch button is live, history records the run, output is added to the canvas.
+9. **(Optional follow-up.)** Add the two advanced parameters (`CREATION_OPTIONS`, `NO_MASK`) once `fill_nodata_file` learns to handle them.
+
+## Changelog
+
+- **2026-05-03** — Refactored to QgsProcessingAlgorithm; QGIS now auto-generates a GDAL-FillNoData-style dialog.
+  - **Added:** [`fill_nodata.py`](fill_nodata.py) (extracted pure numpy/GDAL fill logic, with optional `feedback` plumbing for progress/cancellation), [`gaps_filler_algorithm.py`](gaps_filler_algorithm.py) (`FillNoDataAlgorithm`, id `gapsfiller:fillnodata`, parameters INPUT/BAND/DISTANCE/ITERATIONS/MASK_LAYER/OUTPUT), [`gaps_filler_provider.py`](gaps_filler_provider.py) (`GapsFillerProvider`, id `gapsfiller`, name "Hyperspectral gaps filler").
+  - **Removed:** `gaps_filler_dialog.py`, `gaps_filler_dialog_base.ui` (no longer needed — Processing builds the dialog).
+  - **Modified:** [`gaps_filler.py`](gaps_filler.py) slimmed to provider registration only (no `QAction`, no menu/toolbar, no dialog import); [`pb_tool.cfg`](pb_tool.cfg) `python_files` updated and `main_dialog` cleared; [`metadata.txt`](metadata.txt) `description` reworded for the Processing flow, `version` bumped to 0.2, `hasProcessingProvider=yes`.
+
+- **2026-05-03** — Removed `test/test_gaps_filler_dialog.py` (imported the deleted `gaps_filler_dialog` module; would fail to collect).
