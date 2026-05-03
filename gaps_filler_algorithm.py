@@ -57,8 +57,9 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
             "weighting from the four nearest valid pixels (one per spatial "
             "quadrant), followed by an optional 3x3 smoothing pass.\n\n"
             "Inputs: any GDAL-readable raster, plus an optional validity "
-            "mask (non-zero = valid). Output: GeoTIFF, with all other bands "
-            "copied as-is and geotransform/projection/nodata preserved."
+            "mask (non-zero = valid). Output: a single-band GeoTIFF "
+            "containing only the processed band (matches GDAL FillNodata "
+            "semantics); geotransform, projection and nodata are preserved."
         )
 
     # ---- Parameters --------------------------------------------------------

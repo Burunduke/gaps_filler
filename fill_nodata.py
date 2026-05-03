@@ -353,6 +353,21 @@ def fill_nodata_file(input_path, output_path, band_number=1,
     if feedback is not None:
         feedback.pushInfo("Creating output GeoTIFF: {}".format(output_path))
     driver = gdal.GetDriverByName("GTiff")
+    # If a previous (possibly multi-band) file exists at output_path,
+    # delete it first. driver.Create alone is not always enough to
+    # guarantee a clean replacement — on some platforms the existing
+    # dataset can stay partially live (cached by GDAL/QGIS), which is
+    # what made earlier "single-band" runs still appear multi-band.
+    if gdal.VSIStatL(output_path) is not None:
+        try:
+            driver.Delete(output_path)
+        except RuntimeError:
+            # Fallback: best-effort filesystem delete.
+            import os
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
     # Single-band output (FillNodata operates on one band).
     dst = driver.Create(
         output_path,
@@ -382,9 +397,18 @@ def fill_nodata_file(input_path, output_path, band_number=1,
     if nodata is not None:
         dst.GetRasterBand(1).SetNoDataValue(nodata)
     dst.FlushCache()
+    written_bands = dst.RasterCount
     dst = None
     src = None
 
+    # Re-open read-only to confirm what actually landed on disk.
+    verify = gdal.Open(output_path, gdal.GA_ReadOnly)
+    on_disk_bands = verify.RasterCount if verify is not None else -1
+    verify = None
+
     if feedback is not None:
+        feedback.pushInfo(
+            "Output written: {} band(s) in dataset, {} band(s) on disk."
+            .format(written_bands, on_disk_bands))
         feedback.setProgress(100)
         feedback.pushInfo("Done.")
