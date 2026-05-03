@@ -305,14 +305,13 @@ def fill_nodata(band,
 def fill_nodata_file(input_path, output_path, band_number=1,
                      mask_path=None, max_search_dist=10.0,
                      smoothing_iterations=0, feedback=None):
-    """Read one band of a raster, fill its nodata, write a GeoTIFF copy.
+    """Read one band of a raster, fill its nodata, write a single-band GeoTIFF.
 
-    Mirrors QGIS's "Fill nodata" tool: only the chosen band is processed
-    (other bands are copied as-is to keep the output a valid raster). If
-    ``mask_path`` is given, the first band of that raster is used as the
-    validity mask (non-zero = valid pixel); otherwise the band's own
-    nodata value is used. Geotransform, projection and nodata are
-    preserved by ``CreateCopy``.
+    Mirrors GDAL's ``FillNodata``: the output contains only the selected
+    band (FillNodata operates on a single band). If ``mask_path`` is
+    given, the first band of that raster is used as the validity mask
+    (non-zero = valid pixel); otherwise the band's own nodata value is
+    used. Geotransform, projection and nodata are preserved.
 
     GDAL is used only for I/O — the algorithm runs in :func:`fill_nodata`.
 
@@ -347,14 +346,23 @@ def fill_nodata_file(input_path, output_path, band_number=1,
                                      (src.RasterYSize, src.RasterXSize)))
         mask = marr != 0
 
-    if feedback is not None:
-        feedback.pushInfo("Creating output GeoTIFF: {}".format(output_path))
-    driver = gdal.GetDriverByName("GTiff")
-    dst = driver.CreateCopy(output_path, src, strict=0)
-
     in_band = src.GetRasterBand(band_number)
     arr = in_band.ReadAsArray()
     nodata = in_band.GetNoDataValue()
+
+    if feedback is not None:
+        feedback.pushInfo("Creating output GeoTIFF: {}".format(output_path))
+    driver = gdal.GetDriverByName("GTiff")
+    # Single-band output (FillNodata operates on one band).
+    dst = driver.Create(
+        output_path,
+        src.RasterXSize,
+        src.RasterYSize,
+        1,
+        in_band.DataType,
+    )
+    dst.SetGeoTransform(src.GetGeoTransform())
+    dst.SetProjection(src.GetProjection())
 
     if feedback is not None:
         feedback.pushInfo(
@@ -370,9 +378,9 @@ def fill_nodata_file(input_path, output_path, band_number=1,
         nodata=nodata,
         feedback=feedback,
     )
-    dst.GetRasterBand(band_number).WriteArray(filled)
+    dst.GetRasterBand(1).WriteArray(filled)
     if nodata is not None:
-        dst.GetRasterBand(band_number).SetNoDataValue(nodata)
+        dst.GetRasterBand(1).SetNoDataValue(nodata)
     dst.FlushCache()
     dst = None
     src = None
