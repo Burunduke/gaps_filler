@@ -14,6 +14,7 @@ __copyright__ = 'Copyright 2026, Duke'
 
 import unittest
 
+from qgis.PyQt.QtWidgets import QDialogButtonBox, QDialog
 from qgis.PyQt.QtGui import QDialogButtonBox, QDialog
 
 from gaps_filler_dialog import GapsFillerDialog

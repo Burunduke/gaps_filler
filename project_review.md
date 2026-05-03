@@ -39,27 +39,7 @@ Current reality: it is a **pure skeleton**. No domain logic exists. Running the 
 
 ## Issues & Concerns
 
-1. **`gdal/` is a full clone of the GDAL C++ source repo inside the plugin.** This is the biggest problem:
-   - **Size**: hundreds of MB of C++/CMake/docs that have nothing to do with a Python QGIS plugin. It will bloat the repo and break plugin packaging (QGIS Plugin Manager rejects oversized zips).
-   - **Licensing**: GDAL is MIT/X-style but redistributing the whole tree drags in many third-party headers (`internal_libqhull/`, etc.) with their own notices — needless legal surface.
-   - **Wrong artifact**: that repo is **C++ source**, not a Python library. You cannot `import` from it. The Python bindings (`from osgeo import gdal`) are a separate compiled package.
-   - **Fix**: delete `gdal/` from the project and add it to `.gitignore`. QGIS already ships GDAL — just use `from osgeo import gdal, ogr, osr` directly. No install step needed.
-
-2. **`metadata.txt` placeholders not filled in** ([`metadata.txt`](metadata.txt)):
-   - `tracker=http://bugs`, `repository=http://repo`, `homepage=http://homepage` — invalid URLs.
-   - `about` is identical to `description`; should describe usage/inputs/outputs.
-   - `tags=python` — generic; add domain tags like `raster, hyperspectral, orthophoto, gdal`.
-   - **Stray invalid line** at [`metadata.txt`](metadata.txt:42): `Category of the plugin: Raster, Vector, Database or Web` is **not** a comment (no `#`) — this can break `configparser`. Either prefix with `#` or delete it.
-   - `experimental=True` is fine for now; flip to `False` before publishing.
-   - `changelog=` is commented out — start one as soon as you ship anything.
-
-3. **Bug in test file** [`test/test_gaps_filler_dialog.py`](test/test_gaps_filler_dialog.py:17): imports `QDialogButtonBox, QDialog` from `qgis.PyQt.QtGui`. In PyQt5 these live in `QtWidgets`. Test will fail to import on QGIS 3.x. Also imports `from utilities import get_qgis_app` — no `utilities.py` exists in the project. These tests are dead code today.
-
-4. **`run()` recreates nothing on re-open** ([`gaps_filler.py`](gaps_filler.py:188)): `first_start` guard means the dialog is built once and reused. If you later add layer pickers, you must refresh their contents on each open, not rely on construction.
-
-5. **Empty UI**: [`gaps_filler_dialog_base.ui`](gaps_filler_dialog_base.ui) has only OK/Cancel. Before any logic, the dialog needs at least an input layer / file picker and an output path field.
-
-6. **No `Makefile`** even though [`README.txt`](README.txt:16) and [`pb_tool.cfg`](pb_tool.cfg) reference `make test` / pyrcc5 workflow. Either generate one (`pb_tool` does this) or document `pyrcc5 -o resources.py resources.qrc`.
+1. **`metadata.txt` URL placeholders unresolved**: `tracker=http://bugs`, `repository=http://repo`, `homepage=http://homepage` are still placeholder values. Replace with real URLs or remove the lines before publishing. (`tags`, `about`, the stray `Category of the plugin:` line, and other concerns from the previous review have been fixed.)
 
 ## Recommendations for a Junior Dev
 
@@ -112,3 +92,57 @@ Clarify before writing any code:
 ## Change Log
 
 - **2026-05-02** — Initial project review created.
+- **2026-05-02** — Added a pure-Python re-implementation of `GDALFillNodata`
+  in [`gaps_filler.py`](gaps_filler.py). New top-level helpers:
+  `fill_nodata(band, mask, max_search_dist, smoothing_iterations, nodata, interpolation)`
+  (the algorithm), `_scan_quadrants` and `_smooth_step` (private helpers),
+  and `fill_nodata_file(input_path, output_path, ...)` (thin GDAL I/O
+  wrapper that reads/writes rasters and delegates the actual fill to
+  `fill_nodata`). The plugin had no live `gdal.FillNodata` call yet; the
+  `run()` method now documents `fill_nodata_file` as the wiring hook for
+  future UI work. Dependency added: `numpy` (already shipped with QGIS;
+  no new install step). GDAL is used only for raster I/O.
+- **2026-05-03** — Issue audit & cleanup pass. Closed 5 of 6 review issues:
+  (1) `gdal/` already removed; (3) fixed PyQt5 import in
+  [`test/test_gaps_filler_dialog.py`](test/test_gaps_filler_dialog.py:17)
+  (`QtGui` → `QtWidgets` for `QDialogButtonBox`/`QDialog`);
+  (4) `run()` already rebuilds the dialog every call;
+  (5) dialog already has full widget set;
+  (6) added a minimal hand-crafted [`Makefile`](Makefile) at repo root with
+  `compile` (pyrcc5), `clean`, `test` (placeholder), and `help` targets.
+  Partially fixed (2) [`metadata.txt`](metadata.txt): removed stray
+  `Category of the plugin:` line, set domain tags
+  (`raster, hyperspectral, orthophoto, gdal, nodata, fillnodata`),
+  rewrote `about` to be distinct from `description`. Remaining open work:
+  placeholder `tracker`/`repository`/`homepage` URLs.
+
+## Spec verification (2026-05-02)
+
+`fillnodata_spec.md` was verified against the implementation in `gaps_filler.py` and removed. All requirements (forward/backward quadrant sweeps with diagonal trackers, IDW `1/d²` and NEAREST modes, `d <= max_search_dist` boundary, 3×3 masked-mean smoothing reading from previous iteration, edge cases for empty mask, all-valid passthrough, `max_search_dist <= 0`, integer dtypes, and NaN handling) are implemented.
+
+## End-to-end wiring (2026-05-02)
+
+The plugin now runs end-to-end from QGIS.
+
+- **Dialog** ([`gaps_filler_dialog.py`](gaps_filler_dialog.py)) is built in
+  Python (the `.ui` file is no longer loaded). Widgets mirror QGIS's
+  built-in "Fill nodata" tool:
+  - Input layer — `QgsMapLayerComboBox` filtered to raster layers.
+  - Band number — `QgsRasterBandComboBox`, follows the input layer.
+  - Maximum distance (pixels) — `QSpinBox`, default `10`.
+  - Smoothing iterations — `QSpinBox`, default `0`.
+  - Validity mask (optional) — `QgsMapLayerComboBox` (raster, allows empty).
+  - Output raster — `QgsFileWidget` in `SaveFile` mode (GeoTIFF).
+- **`run()` flow** ([`gaps_filler.py`](gaps_filler.py)): the dialog is
+  rebuilt on every invocation (so layer combos always reflect the current
+  project), parameters are read on accept, [`gaps_filler.fill_nodata_file()`](gaps_filler.py:292)
+  is called, and on success the output is added to the canvas via
+  `iface.addRasterLayer` and a success message is shown on the message
+  bar; failures pop up a `QMessageBox.critical`.
+- **Extended signature**:
+  `fill_nodata_file(input_path, output_path, band_number=1, mask_path=None, max_search_dist=10.0, smoothing_iterations=0)`.
+  Only the chosen band is processed (other bands are copied verbatim by
+  `CreateCopy`, which also preserves geotransform/projection/nodata). If
+  `mask_path` is given, its first band is read and `!= 0` is used as the
+  validity mask; otherwise the band's own nodata value drives the mask
+  inside `fill_nodata`.

@@ -10,7 +10,7 @@ version=0.1
 author=Duke
 email=st087204@student.spbu.ru
 
-about=This plugin fills the gaps in hyperspectral photos to make an ortophoto
+about=Fills NoData gaps in single-band rasters using a pure-Python re-implementation of GDAL's FillNodata (inverse-distance-weighted or nearest interpolation, with optional smoothing). Input: any GDAL-readable raster + optional validity mask. Output: GeoTIFF added to the QGIS canvas.
 
 tracker=http://bugs
 repository=http://repo
@@ -23,7 +23,7 @@ hasProcessingProvider=no
 # changelog=
 
 # Tags are comma separated with spaces allowed
-tags=python
+tags=raster, hyperspectral, orthophoto, gdal, nodata, fillnodata
 
 homepage=http://homepage
 category=Plugins
@@ -39,7 +39,6 @@ deprecated=False
 # Check the documentation for more information.
 # plugin_dependencies=
 
-Category of the plugin: Raster, Vector, Database or Web
 # category=
 
 # If the plugin can run on QGIS Server.
