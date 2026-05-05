@@ -17,9 +17,14 @@ Metrics computed per band (over the intersection of validity masks):
   :func:`skimage.metrics.structural_similarity` (scikit-image required).
 
 NoData handling: pixels marked nodata in **either** the reference or
-the mosaic are excluded from every metric (mask intersection). No
-spatial cropping or alignment is performed — the two rasters must
-already share CRS, resolution and extent.
+the mosaic are excluded from every metric (mask intersection).
+
+Grid alignment: the mosaic typically covers a smaller extent than the
+reference orthophoto. To compare only the overlapping region, the
+reference is warped (in memory) onto the mosaic's exact grid — same
+extent, same pixel size, same projection — before per-band metrics are
+computed. After warping the two arrays share shape by construction, so
+the old "size mismatch" failure cannot occur.
 """
 
 import math
@@ -40,19 +45,64 @@ def _open(path):
     return ds
 
 
-def _grids_match(ref, mos):
-    """Cheap geometric sanity check — same size, GT, projection."""
-    if (ref.RasterXSize, ref.RasterYSize) != (mos.RasterXSize, mos.RasterYSize):
-        return False, "size mismatch: ref={}x{} mos={}x{}".format(
-            ref.RasterXSize, ref.RasterYSize,
-            mos.RasterXSize, mos.RasterYSize)
-    gt_r = ref.GetGeoTransform()
-    gt_m = mos.GetGeoTransform()
-    if any(abs(a - b) > 1e-9 for a, b in zip(gt_r, gt_m)):
-        return False, "geotransform mismatch: {} vs {}".format(gt_r, gt_m)
-    if (ref.GetProjection() or "") != (mos.GetProjection() or ""):
-        return False, "projection mismatch"
-    return True, ""
+def _mosaic_bounds(mos):
+    """Return (minX, minY, maxX, maxY) in mosaic CRS units.
+
+    Assumes a north-up geotransform (pixel height is negative), which
+    is what every raster produced by this plugin uses.
+    """
+    gt = mos.GetGeoTransform()
+    min_x = gt[0]
+    max_y = gt[3]
+    max_x = min_x + gt[1] * mos.RasterXSize
+    min_y = max_y + gt[5] * mos.RasterYSize
+    return (min_x, min_y, max_x, max_y)
+
+
+def _align_reference_to_mosaic(ref, mos, feedback=None):
+    """Warp ``ref`` onto the mosaic's exact grid (in-memory dataset).
+
+    The result has the mosaic's extent, pixel size and projection, so
+    the per-band arrays we read from it are guaranteed to match the
+    mosaic's arrays element-wise. NoData of the source reference is
+    preserved so the existing mask logic still works.
+    """
+    bounds = _mosaic_bounds(mos)
+    gt = mos.GetGeoTransform()
+    px_w = gt[1]
+    px_h = abs(gt[5])
+    dst_srs = mos.GetProjection() or None
+
+    warp_opts = gdal.WarpOptions(
+        format="MEM",
+        outputBounds=bounds,            # (minX, minY, maxX, maxY)
+        xRes=px_w,
+        yRes=px_h,
+        targetAlignedPixels=False,
+        dstSRS=dst_srs,
+        resampleAlg="near",             # keep pixel values intact
+        multithread=False,
+    )
+    if feedback is not None:
+        feedback.pushInfo(
+            "Aligning reference to mosaic grid "
+            "({}x{} px, bounds={})".format(
+                mos.RasterXSize, mos.RasterYSize, bounds))
+    aligned = gdal.Warp("", ref, options=warp_opts)
+    if aligned is None:
+        raise RuntimeError(
+            "Failed to align reference raster to mosaic grid (gdal.Warp "
+            "returned None).")
+
+    # Defensive: shapes must match the mosaic exactly.
+    if (aligned.RasterXSize, aligned.RasterYSize) != \
+            (mos.RasterXSize, mos.RasterYSize):
+        raise RuntimeError(
+            "Reference alignment produced wrong size: "
+            "got {}x{}, expected {}x{}".format(
+                aligned.RasterXSize, aligned.RasterYSize,
+                mos.RasterXSize, mos.RasterYSize))
+    return aligned
 
 
 def _nodata_mask(arr, nodata):
@@ -121,22 +171,20 @@ def compare_rasters(reference_path, mosaic_path, feedback=None):
     IOError
         If a raster cannot be opened.
     ValueError
-        If the two rasters disagree on grid (size / GT / projection)
-        or band count.
+        If the two rasters disagree on band count.
     RuntimeError
-        If scikit-image is not installed (only when SSIM is needed,
-        i.e. there is at least one band with valid pixels).
+        If reference alignment fails, or scikit-image is not installed
+        (the latter only when SSIM is needed, i.e. there is at least
+        one band with valid pixels).
     """
-    ref = _open(reference_path)
+    ref_src = _open(reference_path)
     mos = _open(mosaic_path)
 
-    ok, why = _grids_match(ref, mos)
-    if not ok:
-        msg = ("Reference and mosaic rasters must share grid "
-               "(CRS / resolution / extent): " + why)
-        if feedback is not None:
-            feedback.reportError(msg, fatalError=True)
-        raise ValueError(msg)
+    # Align reference to the mosaic's grid so the two arrays are guaranteed
+    # to have identical shape. The mosaic is the smaller raster (uneven
+    # edges, possibly partial coverage); we keep it as-is and warp the
+    # (typically larger) reference onto its exact extent + pixel grid.
+    ref = _align_reference_to_mosaic(ref_src, mos, feedback=feedback)
 
     if ref.RasterCount != mos.RasterCount:
         msg = "Band count mismatch: ref={} mos={}".format(

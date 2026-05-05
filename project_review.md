@@ -400,3 +400,24 @@ Use a single-stage algorithm when debugging a specific stage, plugging the plugi
     -----+------------+------------+------------+------------+-----------
     MEAN |    12.7283 |     9.1728 |    34.2838 |     0.9087 |
     ```
+
+- **2026-05-05** — Fixed the "size mismatch" failure in
+  [`compare_rasters()`](mosaic_quality.py:144). Before this change the
+  function aborted with `ValueError: size mismatch …` whenever the
+  reference orthophoto and the built mosaic had different extents,
+  which is the **normal** case (the mosaic only covers part of the
+  flight area). The previous strict `_grids_match` check was replaced
+  by a single in-memory `gdal.Warp` call (new helper
+  [`_align_reference_to_mosaic()`](mosaic_quality.py:48)) that warps
+  the reference onto the mosaic's exact grid — same `outputBounds`,
+  same `xRes`/`yRes`, same projection, `resampleAlg="near"` so pixel
+  values are not altered, `format="MEM"` so nothing hits disk. After
+  warping the two per-band arrays are guaranteed to have identical
+  shape, so the comparison proceeds normally and per-band NoData masks
+  (preserved through the warp) still drive the valid-pixel filter.
+  Chosen approach: **gdal.Warp align** (single API call, junior-
+  friendly) over the alternative mask-and-clip path. No new files;
+  [`pb_tool.cfg`](pb_tool.cfg) unchanged. Algorithm parameters and
+  outputs of [`MosaicQualityAlgorithm`](mosaic_quality_algorithm.py:20)
+  are untouched; only its `shortHelpString()` was updated to describe
+  the new behaviour.
