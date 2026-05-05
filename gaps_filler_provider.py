@@ -8,6 +8,8 @@ from qgis.core import QgsProcessingProvider
 from .resources import *  # noqa: F401,F403
 from .gaps_filler_algorithm import FillNoDataAlgorithm
 from .hyperspectral_algorithm import HyperspectralPipelineAlgorithm
+from .frame_filter_algorithm import FrameFilterAlgorithm
+from .mosaic_algorithm import MosaicAlgorithm
 
 
 class GapsFillerProvider(QgsProcessingProvider):
@@ -26,3 +28,5 @@ class GapsFillerProvider(QgsProcessingProvider):
     def loadAlgorithms(self):
         self.addAlgorithm(FillNoDataAlgorithm())
         self.addAlgorithm(HyperspectralPipelineAlgorithm())
+        self.addAlgorithm(FrameFilterAlgorithm())
+        self.addAlgorithm(MosaicAlgorithm())

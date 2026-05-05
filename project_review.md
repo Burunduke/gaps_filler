@@ -337,10 +337,12 @@ input rasters ──▶ filter ──▶ mosaic ──▶ fill_nodata ──▶ 
 - [`mosaic.py`](mosaic.py:1) — Stage B; band-streaming mosaic. Public API: [`MosaicInputError`](mosaic.py:33) (raised on incompatible inputs), [`validate_inputs()`](mosaic.py:42) (cross-frame CRS / pixel size / band count / dtype check, returns a summary dict), [`mosaic_frames()`](mosaic.py:96) (writes the mosaic; takes an optional `progress=callable(fraction, message)`). Output is **float32** with **NaN** as NoData; overlapping pixels follow **first-write-wins** (`rasterio.merge.merge` with `method="first"`); container is a tiled, deflate-compressed BigTIFF (512×512 blocks).
 - [`pipeline.py`](pipeline.py:1) — Stage C orchestrator that chains A → B → C. Public API: [`run_pipeline(input_paths: list[str], output_path: str, *, max_distance: int = 100, smoothing_iterations: int = 0, progress: Optional[Callable[[float, str], None]] = None) -> dict`](pipeline.py:32). The returned dict carries `input_count`, `kept_count`, `rejected` (list of `(path, reason)`), `output_path`, and `band_count`.
 - [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py:1) — QGIS Processing wrapper. [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:22) registers as `gapsfiller:hyperspectral_pipeline` (display name "Hyperspectral pipeline (filter, mosaic, fill)", group "Raster analysis"). Four parameters: [`INPUT_LAYERS`](hyperspectral_algorithm.py:25) (`QgsProcessingParameterMultipleLayers`, raster), [`MAX_DISTANCE`](hyperspectral_algorithm.py:26) (integer, default `100`, min `1`), [`SMOOTHING_ITERATIONS`](hyperspectral_algorithm.py:27) (integer, default `0`, min `0`), [`OUTPUT`](hyperspectral_algorithm.py:28) (`QgsProcessingParameterRasterDestination`).
+- [`frame_filter_algorithm.py`](frame_filter_algorithm.py:1) — standalone Stage A wrapper. [`FrameFilterAlgorithm`](frame_filter_algorithm.py:24) registers as `gapsfiller:frame_filter` (display name "Filter bad frames", group "Raster analysis"). Parameters: [`INPUT_LAYERS`](frame_filter_algorithm.py:27) (`QgsProcessingParameterMultipleLayers`, raster), [`OUTPUT_FOLDER`](frame_filter_algorithm.py:28) (`QgsProcessingParameterFolderDestination`), [`REPORT`](frame_filter_algorithm.py:29) (optional `QgsProcessingParameterFileDestination`, `.txt`). Output: a folder containing the kept frames (copied via `shutil.copy2`) plus a text report listing kept and rejected frames with rejection reasons.
+- [`mosaic_algorithm.py`](mosaic_algorithm.py:1) — standalone Stage B wrapper. [`MosaicAlgorithm`](mosaic_algorithm.py:20) registers as `gapsfiller:mosaic_frames` (display name "Mosaic frames (first-write-wins)", group "Raster analysis"). Parameters: [`INPUT_LAYERS`](mosaic_algorithm.py:23) (`QgsProcessingParameterMultipleLayers`, raster), [`OUTPUT`](mosaic_algorithm.py:24) (`QgsProcessingParameterRasterDestination`). Thin wrapper around [`mosaic.mosaic_frames`](mosaic.py:96) with a progress callback that forwards to `feedback`.
 
 ### Existing files touched
 
-Exactly two lines were added in [`gaps_filler_provider.py`](gaps_filler_provider.py:1): an `import` of [`HyperspectralPipelineAlgorithm`](gaps_filler_provider.py:10) and a matching [`self.addAlgorithm(...)`](gaps_filler_provider.py:28) call inside `loadAlgorithms()`. No other existing file was modified. [`fill_nodata.fill_nodata`](fill_nodata.py:1) is reused **unchanged at the array level** — `pipeline.py` reads each mosaic band into a numpy array, calls it directly, and writes the filled array back, avoiding a per-band GDAL round-trip.
+[`gaps_filler_provider.py`](gaps_filler_provider.py:1) is the only existing file modified for the pipeline work. Its [`loadAlgorithms()`](gaps_filler_provider.py:28) now registers four algorithms — the original [`FillNoDataAlgorithm`](gaps_filler_provider.py:9), [`HyperspectralPipelineAlgorithm`](gaps_filler_provider.py:10), [`FrameFilterAlgorithm`](gaps_filler_provider.py:11), and [`MosaicAlgorithm`](gaps_filler_provider.py:12) — so the file carries 4 imports and 4 matching `self.addAlgorithm(...)` lines. [`fill_nodata.fill_nodata`](fill_nodata.py:1) is reused **unchanged at the array level** — `pipeline.py` reads each mosaic band into a numpy array, calls it directly, and writes the filled array back, avoiding a per-band GDAL round-trip.
 
 ### Locked decisions
 
@@ -357,12 +359,16 @@ Exactly two lines were added in [`gaps_filler_provider.py`](gaps_filler_provider
 - Frame-filter heuristics use static thresholds (module-level constants in [`frame_filter.py`](frame_filter.py:29)); per-flight tuning may be needed.
 - Overlap method is fixed to first-write-wins; no feathering or averaging yet.
 - No caching of intermediate mosaic — the temp file `<output>.mosaic.tif` is deleted after Stage C.
+- The standalone [`FrameFilterAlgorithm`](frame_filter_algorithm.py:24) **copies** kept frames into the output folder (no symlink), so disk usage is roughly doubled for the kept set.
 - No tests added (per project policy).
 
 ### How to use from QGIS
 
-- Open the **Processing Toolbox**.
-- Under **Hyperspectral gaps filler → Raster analysis**, pick **"Hyperspectral pipeline (filter, mosaic, fill)"**.
-- In the dialog, select multiple raster layers (the PIKA-L per-frame GeoTIFFs) for **Input frames**.
-- Set **Maximum distance** (search radius for gap fill, in pixels) and **Smoothing iterations**.
-- Choose the **Filled mosaic** output path and run; the rejected-frame report appears in the Processing log.
+The Processing Toolbox group **Hyperspectral gaps filler → Raster analysis** now exposes four algorithms:
+
+- **"Filter bad frames"** ([`FrameFilterAlgorithm`](frame_filter_algorithm.py:24)) — Stage A only; copies surviving frames into a folder and writes a rejection report.
+- **"Mosaic frames (first-write-wins)"** ([`MosaicAlgorithm`](mosaic_algorithm.py:20)) — Stage B only; mosaics the supplied frames into a single GeoTIFF.
+- **"Fill nodata"** ([`FillNoDataAlgorithm`](gaps_filler_algorithm.py:1)) — Stage C only; the original single-raster gap-fill algorithm.
+- **"Hyperspectral pipeline (filter, mosaic, fill)"** ([`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:22)) — all three stages end-to-end.
+
+Use a single-stage algorithm when debugging a specific stage, plugging the plugin into a custom Model Builder workflow, or re-running just one step on already-prepared inputs. Use the end-to-end pipeline for normal use — pick raster layers as **Input frames**, set **Maximum distance** and **Smoothing iterations**, choose the **Filled mosaic** output path and run; the rejected-frame report appears in the Processing log.
