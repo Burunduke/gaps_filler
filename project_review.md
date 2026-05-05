@@ -735,3 +735,35 @@ inputs the result is byte-identical to the previous code path. Only
     matches (Stage C no longer calls the array fn directly);
     `grep -n "gap_fill_func" pipeline.py hyperspectral_algorithm.py`
     confirmed the kwarg is defined, defaulted, and passed end-to-end.
+
+- **2026-05-05** — Footprint-aware gap-fill in the hyperspectral pipeline.
+  Both v2 ([`fill_nodata.fill_nodata_file`](fill_nodata.py:305)) and v3
+  ([`fill_nodata.fill_nodata_file_gdal`](fill_nodata.py:436)) used to
+  spread filled values out to the raster bounding box, far past the
+  actual swath. Now [`pipeline.run_pipeline()`](pipeline.py:1) builds a
+  validity mask from the Stage-B mosaic (union across bands of finite
+  pixels, streamed band-by-band with `np.logical_or`), computes the
+  interior holes via `scipy.ndimage.binary_fill_holes` (with a
+  pure-numpy 4-connected flood-fill fallback — scipy is not currently
+  a project dep, verified by grep), writes a 0/1 uint8 GeoTIFF with
+  `0` only on interior holes and `1` everywhere else (valid + outside),
+  and forwards it as `mask_path=` to the gap-fill callable. Single
+  polarity covers both backends: v2 preserves any pixel with `mask!=0`
+  (so outside-footprint NaN stays NaN), v3 only fills targets where
+  the mask band is zero (same effect). New opt-out kwarg
+  `fill_only_interior: bool = True` on `run_pipeline()`; when `False`
+  the call reverts to today's `mask_path=None` behaviour byte-for-byte.
+  Exposed as a checkbox `FILL_ONLY_INTERIOR` (default `True`) in
+  [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py:1). The
+  standalone [`FillNoDataAlgorithm`](gaps_filler_algorithm.py:1) is
+  intentionally untouched — it operates on a user-supplied raster
+  with a user-supplied mask, where "footprint" is not well-defined.
+  The `<output>.fillmask.tif` is removed in `finally` on success and
+  failure. **Files modified:** [`pipeline.py`](pipeline.py),
+  [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py),
+  [`hyperspectral_plan.md`](hyperspectral_plan.md). Helper signatures
+  unchanged for `fill_nodata.fill_nodata_file`,
+  `fill_nodata.fill_nodata_file_gdal`, `mosaic.mosaic_frames`,
+  `mosaic.validate_inputs`, `frame_filter.filter_frames`.
+  `python3 -m py_compile pipeline.py hyperspectral_algorithm.py`
+  exited 0.

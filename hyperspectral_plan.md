@@ -508,6 +508,9 @@ commercial-grade tool. Ordered roughly by ROI.
 
 ### Quality
 
+- [x] **Footprint-aware gap-fill** — pipeline builds a validity-mask
+  via `binary_fill_holes` and forwards as `mask_path` so both v2 and v3
+  only touch interior holes (done 2026-05-05).
 - [ ] **Add mosaic v4 (feathered blending)** in
   [`mosaic.py`](mosaic.py:1) as an opt-in `method="feather"` option in
   the new `MOSAIC_METHOD` dropdown. Adds `scipy` dep (already pulled by

@@ -33,10 +33,10 @@ from rasterio.windows import Window
 SKEW_MAX: float = 0.05
 AREA_LO: float = 0.5
 AREA_HI: float = 2.0
-ASPECT_MAX: float = 2.0
+ASPECT_MAX: float = 4.0
 CENTRE_WINDOW: int = 64
 MIN_VALID_FRACTION: float = 0.5
-STD_MIN: float = 1.0
+STD_MIN: float = 0.005
 SATURATION_FRACTION: float = 0.95
 
 

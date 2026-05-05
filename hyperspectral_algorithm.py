@@ -40,6 +40,7 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
     SMOOTHING_ITERATIONS = "SMOOTHING_ITERATIONS"
     OUTPUT = "OUTPUT"
     REPROJECT_TO_FIRST = "REPROJECT_TO_FIRST"
+    FILL_ONLY_INTERIOR = "FILL_ONLY_INTERIOR"
 
     FRAME_FILTER_METHOD = "FRAME_FILTER_METHOD"
     MOSAIC_METHOD = "MOSAIC_METHOD"
@@ -193,6 +194,15 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
         )
 
         self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.FILL_ONLY_INTERIOR,
+                self.tr("Fill only interior holes (leave outside-footprint "
+                        "pixels as NoData)"),
+                defaultValue=True,
+            )
+        )
+
+        self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT, self.tr("Filled mosaic")
             )
@@ -237,6 +247,8 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
 
         reproject_to_first = self.parameterAsBoolean(
             parameters, self.REPROJECT_TO_FIRST, context)
+        fill_only_interior = self.parameterAsBoolean(
+            parameters, self.FILL_ONLY_INTERIOR, context)
 
         # Validate inputs up-front so the user gets a clear error in
         # ~1 second on a CRS / pixel-size / band-count / dtype mismatch
@@ -302,6 +314,7 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
                 log=feedback.pushInfo,
                 reproject_to_first=reproject_to_first,
                 gap_fill_func=gap_fill_func,
+                fill_only_interior=fill_only_interior,
             )
             # Stages A and B still use their single implemented version
             # internally; touch the resolved callables so static analysers
