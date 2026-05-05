@@ -13,6 +13,7 @@ from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
     QgsProcessingException,
+    QgsProcessingParameterEnum,
     QgsProcessingParameterFileDestination,
     QgsProcessingParameterFolderDestination,
     QgsProcessingParameterMultipleLayers,
@@ -20,6 +21,7 @@ from qgis.core import (
 )
 
 from . import frame_filter
+from . import methods
 from .frame_filter import (
     AREA_HI,
     AREA_LO,
@@ -42,6 +44,7 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
     INPUT_LAYERS = "INPUT_LAYERS"
     OUTPUT_FOLDER = "OUTPUT_FOLDER"
     REPORT = "REPORT"
+    FRAME_FILTER_METHOD = "FRAME_FILTER_METHOD"
 
     SKEW_MAX = "SKEW_MAX"
     AREA_LO = "AREA_LO"
@@ -92,6 +95,15 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
                 layerType=QgsProcessing.TypeRaster,
             )
         )
+        method_param = QgsProcessingParameterEnum(
+            self.FRAME_FILTER_METHOD,
+            self.tr("Filter method"),
+            options=methods.labels(methods.FRAME_FILTER_METHODS),
+            defaultValue=0,
+        )
+        method_param.setHelp(methods.tooltip_block(
+            methods.FRAME_FILTER_METHODS))
+        self.addParameter(method_param)
         self.addParameter(
             QgsProcessingParameterFolderDestination(
                 self.OUTPUT_FOLDER,
@@ -180,8 +192,14 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
 
         paths = [lyr.source() for lyr in layers]
 
+        method_idx = self.parameterAsEnum(
+            parameters, self.FRAME_FILTER_METHOD, context)
+        method_entry = methods.FRAME_FILTER_METHODS[method_idx]
+        feedback.pushInfo(
+            "Frame filter method: {}".format(method_entry["id"]))
+
         try:
-            good, rejected = frame_filter.filter_frames(
+            good, rejected = method_entry["func"](
                 paths, thresholds=thresholds)
         except Exception as exc:
             raise QgsProcessingException(str(exc))

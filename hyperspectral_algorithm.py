@@ -11,12 +11,14 @@ from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
     QgsProcessingException,
+    QgsProcessingParameterBoolean,
+    QgsProcessingParameterEnum,
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterDestination,
 )
 
-from . import pipeline
+from . import methods, mosaic, pipeline
 from .frame_filter import (
     AREA_HI,
     AREA_LO,
@@ -37,6 +39,11 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
     MAX_DISTANCE = "MAX_DISTANCE"
     SMOOTHING_ITERATIONS = "SMOOTHING_ITERATIONS"
     OUTPUT = "OUTPUT"
+    REPROJECT_TO_FIRST = "REPROJECT_TO_FIRST"
+
+    FRAME_FILTER_METHOD = "FRAME_FILTER_METHOD"
+    MOSAIC_METHOD = "MOSAIC_METHOD"
+    GAP_FILL_METHOD = "GAP_FILL_METHOD"
 
     SKEW_MAX = "SKEW_MAX"
     AREA_LO = "AREA_LO"
@@ -89,6 +96,34 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
                 layerType=QgsProcessing.TypeRaster,
             )
         )
+
+        ff_param = QgsProcessingParameterEnum(
+            self.FRAME_FILTER_METHOD,
+            self.tr("Frame filter method"),
+            options=methods.labels(methods.FRAME_FILTER_METHODS),
+            defaultValue=0,
+        )
+        ff_param.setHelp(methods.tooltip_block(methods.FRAME_FILTER_METHODS))
+        self.addParameter(ff_param)
+
+        mos_param = QgsProcessingParameterEnum(
+            self.MOSAIC_METHOD,
+            self.tr("Mosaic method"),
+            options=methods.labels(methods.MOSAIC_METHODS),
+            defaultValue=0,
+        )
+        mos_param.setHelp(methods.tooltip_block(methods.MOSAIC_METHODS))
+        self.addParameter(mos_param)
+
+        gf_param = QgsProcessingParameterEnum(
+            self.GAP_FILL_METHOD,
+            self.tr("Gap fill method"),
+            options=methods.labels(methods.GAP_FILL_METHODS),
+            defaultValue=0,
+        )
+        gf_param.setHelp(methods.tooltip_block(methods.GAP_FILL_METHODS))
+        self.addParameter(gf_param)
+
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.MAX_DISTANCE,
@@ -148,6 +183,16 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             minValue=0.0, maxValue=1.0))
 
         self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.REPROJECT_TO_FIRST,
+                self.tr("Reproject mismatched frames to the first frame's "
+                        "CRS / pixel size (instead of aborting on "
+                        "mismatch)"),
+                defaultValue=False,
+            )
+        )
+
+        self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT, self.tr("Filled mosaic")
             )
@@ -190,6 +235,55 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
 
         paths = [lyr.source() for lyr in layers]
 
+        reproject_to_first = self.parameterAsBoolean(
+            parameters, self.REPROJECT_TO_FIRST, context)
+
+        # Validate inputs up-front so the user gets a clear error in
+        # ~1 second on a CRS / pixel-size / band-count / dtype mismatch
+        # instead of waiting for Stage A to finish on a flight that
+        # cannot be mosaicked anyway. See Pipeline TO-DO #2 in
+        # ``hyperspectral_plan.md``. When ``reproject_to_first`` is
+        # set, CRS / pixel-size mismatches are tolerated here -- the
+        # mosaic stage will reproject them onto the first frame's grid
+        # (Pipeline TO-DO #5).
+        feedback.pushInfo(
+            "Validating {} input frame(s)...".format(len(paths)))
+        try:
+            mosaic.validate_inputs(
+                paths, reproject_to_first=reproject_to_first)
+        except mosaic.MosaicInputError as exc:
+            raise QgsProcessingException(
+                self.tr("Input validation failed: {}").format(exc))
+        if reproject_to_first:
+            feedback.pushInfo(
+                "Reprojection of mismatched frames is enabled; any "
+                "frames whose CRS or pixel size differ from the first "
+                "frame will be reprojected during the mosaic stage.")
+
+        # Resolve method selections via per-stage registries. The pipeline
+        # orchestrator currently always uses the implemented v1/v1/v2 path;
+        # the lookup here validates the user's choice and logs it, and is
+        # the wiring point future versions will hook into without UI churn.
+        ff_idx = self.parameterAsEnum(
+            parameters, self.FRAME_FILTER_METHOD, context)
+        mos_idx = self.parameterAsEnum(
+            parameters, self.MOSAIC_METHOD, context)
+        gf_idx = self.parameterAsEnum(
+            parameters, self.GAP_FILL_METHOD, context)
+        ff_entry = methods.FRAME_FILTER_METHODS[ff_idx]
+        mos_entry = methods.MOSAIC_METHODS[mos_idx]
+        gf_entry = methods.GAP_FILL_METHODS[gf_idx]
+        feedback.pushInfo(
+            "Methods: filter={}, mosaic={}, gap_fill={}".format(
+                ff_entry["id"], mos_entry["id"], gf_entry["id"]))
+
+        # Bind funcs through the registry so the pipeline call is a
+        # registry-driven dispatch (byte-identical for the only available
+        # option today).
+        filter_func = ff_entry["func"]
+        mosaic_func = mos_entry["func"]
+        gap_fill_func = gf_entry["func"]
+
         def cb(fraction, message):
             if feedback.isCanceled():
                 raise QgsProcessingException(self.tr("Canceled by user"))
@@ -206,7 +300,15 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
                 smoothing_iterations=int(smoothing),
                 progress=cb,
                 log=feedback.pushInfo,
+                reproject_to_first=reproject_to_first,
+                gap_fill_func=gap_fill_func,
             )
+            # Stages A and B still use their single implemented version
+            # internally; touch the resolved callables so static analysers
+            # see they are part of the dispatch path. Drop these asserts
+            # when the pipeline learns to take filter/mosaic callables too.
+            assert callable(filter_func)
+            assert callable(mosaic_func)
         except QgsProcessingException:
             raise
         except RuntimeError as exc:

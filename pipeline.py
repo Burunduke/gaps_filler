@@ -1,25 +1,80 @@
 # -*- coding: utf-8 -*-
 """Stage C orchestrator of the hyperspectral pipeline.
 
-Chains Stage A (:mod:`frame_filter`) → Stage B (:mod:`mosaic`) → Stage C
-(per-band gap fill via :func:`fill_nodata.fill_nodata`). The mosaic from
-Stage B is a float32 GeoTIFF with NaN as NoData; Stage C reads each band
-into a numpy array, calls the existing array-level
-:func:`fill_nodata.fill_nodata` (a 2-D numpy in / 2-D numpy out function
-— see ``fill_nodata.py``), and writes the filled band into the final
-output. ``osgeo.gdal`` is intentionally not used here: the public API of
-``fill_nodata`` is pure numpy, so a GDAL round-trip would be wasted I/O.
+Chains Stage A (:mod:`frame_filter`) -> Stage B (:mod:`mosaic`) ->
+Stage C (file-level gap fill via a callable from
+:data:`methods.GAP_FILL_METHODS`). The mosaic from Stage B is written
+to disk as ``<output>.mosaic.tif`` (float32 GeoTIFF with NaN as NoData)
+and Stage C is a single call into the registry-supplied gap-fill
+function which reads the mosaic, fills every band, and writes the final
+output. The default callable is :func:`fill_nodata.fill_nodata_file`
+(v2 IDW -- which itself loops the array-level
+:func:`fill_nodata.fill_nodata` band-by-band, so the default code path
+is byte-equivalent to the historical in-pipeline loop);
+:class:`HyperspectralPipelineAlgorithm` swaps in
+:func:`fill_nodata.fill_nodata_file_gdal` (v3) when the user selects it
+from the dropdown.
 """
 
 from __future__ import annotations
 
+import csv
 import os
+import re
 from typing import Callable, Optional
 
 import numpy as np
 import rasterio
 
 from . import fill_nodata, frame_filter, mosaic
+
+
+# Reasons emitted by ``frame_filter.is_bad_frame`` follow a fixed shape:
+# ``"<text> (key=<measured> <op> <threshold>)"`` for scalar comparisons or
+# ``"<text> (key=<measured>, allowed=[<lo>, <hi>])"`` for the area check.
+# These two regexes pull the numeric measured value and threshold out so
+# the rejected-frames CSV (Pipeline TO-DO item #6 in
+# ``hyperspectral_plan.md``) carries them as separate columns. If a reason
+# does not match (future heuristic, unexpected text), the columns stay
+# empty and the full reason string is still recorded.
+_REASON_SCALAR_RE = re.compile(
+    r"\(\s*[A-Za-z_]+\s*=\s*([-+0-9.eE+inf]+)\s*[<>]\s*([-+0-9.eE+inf]+)\s*\)"
+)
+_REASON_RANGE_RE = re.compile(
+    r"\(\s*[A-Za-z_]+\s*=\s*([-+0-9.eEinf]+)\s*,\s*allowed\s*=\s*"
+    r"\[\s*([-+0-9.eEinf]+)\s*,\s*([-+0-9.eEinf]+)\s*\]\s*\)"
+)
+
+
+def _parse_reason(reason: str) -> tuple[str, str]:
+    """Extract ``(measured_value, threshold)`` from a rejection reason string.
+
+    Returns ``("", "")`` when the reason text does not follow the known
+    shape so the caller can still write a row with the raw reason.
+    """
+    m = _REASON_SCALAR_RE.search(reason)
+    if m:
+        return m.group(1), m.group(2)
+    m = _REASON_RANGE_RE.search(reason)
+    if m:
+        return m.group(1), "[{}, {}]".format(m.group(2), m.group(3))
+    return "", ""
+
+
+def _write_rejected_report(report_path: str,
+                           rejected: list[tuple[str, str]]) -> None:
+    """Write ``rejected`` to ``report_path`` as a CSV for audit.
+
+    Columns: ``path, reason, measured_value, threshold``. Always written
+    (even when ``rejected`` is empty) so the presence of the file is a
+    deterministic signal that Stage A ran.
+    """
+    with open(report_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["path", "reason", "measured_value", "threshold"])
+        for path, reason in rejected:
+            measured, threshold = _parse_reason(reason)
+            writer.writerow([path, reason, measured, threshold])
 
 
 _ProgressCb = Callable[[float, str], None]
@@ -34,6 +89,37 @@ def _noop_log(message: str) -> None:
     return None
 
 
+class _PipelineFeedback:
+    """Duck-typed ``QgsProcessingFeedback`` bridging into our progress / log
+    callbacks.
+
+    The registry-supplied gap-fill callables (``fill_nodata_file`` /
+    ``fill_nodata_file_gdal``) accept a ``feedback`` object and use it for
+    ``pushInfo`` / ``setProgress`` / ``isCanceled``. This shim forwards
+    those calls into the ``progress`` and ``log`` callbacks ``run_pipeline``
+    already receives, mapping setProgress(0..100) into the [0.70 .. 1.00]
+    fraction window reserved for Stage C.
+    """
+
+    def __init__(self, progress: _ProgressCb, log: _LogCb) -> None:
+        self._progress = progress
+        self._log = log
+
+    def pushInfo(self, message: str) -> None:  # noqa: N802 (QGIS API name)
+        self._log(message)
+
+    def reportError(self, message: str, fatalError: bool = False) -> None:  # noqa: N802,N803
+        self._log(message)
+
+    def setProgress(self, percent: float) -> None:  # noqa: N802
+        # Stage C occupies the last 30% of the pipeline's progress bar.
+        frac = 0.70 + 0.30 * max(0.0, min(100.0, float(percent))) / 100.0
+        self._progress(frac, "")
+
+    def isCanceled(self) -> bool:  # noqa: N802
+        return False
+
+
 def run_pipeline(
     input_paths: list[str],
     output_path: str,
@@ -43,10 +129,22 @@ def run_pipeline(
     smoothing_iterations: int = 0,
     progress: Optional[_ProgressCb] = None,
     log: Optional[_LogCb] = None,
+    reproject_to_first: bool = False,
+    gap_fill_func: Optional[Callable[..., None]] = None,
 ) -> dict:
-    """Run filter → mosaic → fill_nodata. Return a summary dict."""
+    """Run filter -> mosaic -> fill_nodata. Return a summary dict.
+
+    ``gap_fill_func`` is a file-level callable from
+    :data:`methods.GAP_FILL_METHODS` with signature
+    ``(input_path, output_path, *, mask_path=None, max_search_dist,
+    smoothing_iterations, feedback)``. When ``None``, defaults to
+    :func:`fill_nodata.fill_nodata_file` (v2) so existing callers keep
+    working byte-equivalently to the previous in-pipeline per-band loop.
+    """
     cb: _ProgressCb = progress if progress is not None else _noop
     log_cb: _LogCb = log if log is not None else _noop_log
+    if gap_fill_func is None:
+        gap_fill_func = fill_nodata.fill_nodata_file
 
     # ---- Stage A: filter -------------------------------------------------
     good, rejected = frame_filter.filter_frames(
@@ -54,59 +152,72 @@ def run_pipeline(
     for p, reason in rejected:
         log_cb("REJECTED {}: {}".format(os.path.basename(p), reason))
     log_cb("Kept {} / {} frames".format(len(good), len(input_paths)))
+
+    # Persist the rejected-frames report next to the final output for
+    # audit (Pipeline TO-DO item #6 in ``hyperspectral_plan.md``). The
+    # file is written before the all-rejected guard below so the user
+    # can inspect *why* every frame was dropped without re-running the
+    # filter pass. Best-effort: a write failure is logged but does not
+    # abort the pipeline.
+    report_path = output_path + ".rejected.csv"
+    try:
+        _write_rejected_report(report_path, rejected)
+        log_cb("Rejected-frames report written to {}".format(report_path))
+    except OSError as exc:
+        log_cb("WARNING: could not write rejected-frames report "
+               "({}): {}".format(report_path, exc))
+
     if len(good) == 0:
         raise RuntimeError("all frames rejected by filter")
     cb(0.05, "filtered: {} kept, {} rejected".format(len(good), len(rejected)))
 
     # ---- Stage B: mosaic -------------------------------------------------
-    # Choice: place the temp mosaic next to the final output as
-    # ``<output>.mosaic.tif``. Simplest possible — no tempfile bookkeeping,
+    # Place the temp mosaic next to the final output as
+    # ``<output>.mosaic.tif``. Simplest possible -- no tempfile bookkeeping,
     # path is predictable for debugging, and it is removed at the end.
+    # Stage C consumes this file, so the on-disk intermediate is now a
+    # required hand-off rather than just a helpful artefact.
     mosaic_path = output_path + ".mosaic.tif"
     mosaic.mosaic_frames(
         good,
         mosaic_path,
         progress=lambda f, m: cb(0.05 + 0.65 * f, "mosaic: " + m),
+        reproject_to_first=reproject_to_first,
     )
 
-    # ---- Stage C: per-band gap fill -------------------------------------
+    band_count = 0
     try:
+        # All-NaN-band guard (Pipeline TO-DO item #4): scan the Stage-B
+        # mosaic on disk before invoking the file-level gap-fill callable.
+        # Either gap-fill backend (v2 pure-Python or v3 gdal.FillNodata)
+        # would silently produce an all-NaN output for an all-NaN input
+        # band. Aborting here preserves the previous in-pipeline guard's
+        # behaviour with a clear diagnostic.
         with rasterio.open(mosaic_path) as src:
-            profile = src.profile.copy()
             band_count = int(src.count)
-            descriptions = src.descriptions
-
-        # Make sure the destination is a fresh, sane GeoTIFF.
-        profile.update(driver="GTiff")
-
-        with rasterio.open(mosaic_path) as src, \
-                rasterio.open(output_path, "w", **profile) as dst:
-            if descriptions:
-                for i, desc in enumerate(descriptions, start=1):
-                    if desc:
-                        dst.set_band_description(i, desc)
-
             for b in range(1, band_count + 1):
                 arr = src.read(b)
-                # Call site for the existing array-level fill function.
-                # See ``fill_nodata.py`` -> ``def fill_nodata(band, mask=None,
-                # max_search_dist=100.0, smoothing_iterations=0, nodata=None,
-                # interpolation="INV_DIST", feedback=None)``. Mosaic NoData
-                # is NaN (set by ``mosaic.mosaic_frames``), so passing
-                # ``nodata=np.nan`` lets the function derive the validity
-                # mask itself.
-                filled = fill_nodata.fill_nodata(
-                    arr,
-                    max_search_dist=float(max_distance),
-                    smoothing_iterations=int(smoothing_iterations),
-                    nodata=np.nan,
-                )
-                if filled.dtype != np.float32:
-                    filled = filled.astype(np.float32)
-                dst.write(filled, b)
+                if not np.isfinite(arr).any():
+                    raise RuntimeError(
+                        "band {}/{} is entirely NoData (all-NaN); "
+                        "aborting gap fill".format(b, band_count))
 
-                frac = 0.70 + 0.30 * (b / band_count)
-                cb(frac, "fill: band {}/{}".format(b, band_count))
+        cb(0.70, "fill: dispatching gap-fill on {} band(s)".format(band_count))
+
+        # ---- Stage C: registry-driven file-level gap fill ----------------
+        # The two file-level callables in ``methods.GAP_FILL_METHODS``
+        # share a signature (``fill_nodata_file`` / ``fill_nodata_file_gdal``).
+        # They take the same ``max_search_dist`` and ``smoothing_iterations``
+        # kwargs that ``run_pipeline`` already exposes; forward them as-is.
+        gap_fill_func(
+            mosaic_path,
+            output_path,
+            mask_path=None,
+            max_search_dist=float(max_distance),
+            smoothing_iterations=int(smoothing_iterations),
+            feedback=_PipelineFeedback(cb, log_cb),
+        )
+        cb(1.0, "fill: done")
     finally:
         # Best-effort temp cleanup.
         try:

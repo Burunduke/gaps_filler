@@ -11,6 +11,7 @@ Current reality: it is a **pure skeleton**. No domain logic exists. Running the 
 | File | Role |
 |---|---|
 | [`__init__.py`](__init__.py) | QGIS entry point — exposes `classFactory(iface)` that returns a `GapsFiller` instance. |
+| [`methods.py`](methods.py) | Per-stage method registries (`FRAME_FILTER_METHODS`, `MOSAIC_METHODS`, `GAP_FILL_METHODS`). Plain Python lists of dicts (`id`, `label`, `tooltip`, `func`) — the dispatch source of truth for the per-stage method dropdowns in the QGIS algorithms. |
 | [`gaps_filler.py`](gaps_filler.py) | Main plugin class: registers menu/toolbar action, opens the dialog. No business logic. |
 | [`gaps_filler_dialog.py`](gaps_filler_dialog.py) | Thin wrapper that loads the `.ui` file into a `QDialog` subclass. |
 | [`gaps_filler_dialog_base.ui`](gaps_filler_dialog_base.ui) | Qt Designer UI — empty 400×300 dialog with only an OK/Cancel button box. |
@@ -421,3 +422,316 @@ Use a single-stage algorithm when debugging a specific stage, plugging the plugi
   outputs of [`MosaicQualityAlgorithm`](mosaic_quality_algorithm.py:20)
   are untouched; only its `shortHelpString()` was updated to describe
   the new behaviour.
+
+- **2026-05-05** — Fully rewrote [`hyperspectral_plan.md`](hyperspectral_plan.md)
+  as a comparative-analysis document. It is now organised into three
+  blocks — **frame filtering**, **mosaic building**, **gap filling** —
+  each listing approaches from simple to complex with pros/cons and
+  when-to-use guidance. A final actionable **Pipeline TO-DO** checklist
+  groups concrete next steps into Robustness, Performance, Quality,
+  Usability/QGIS, and Maintenance buckets for reaching commercial-grade
+  quality.
+
+- **2026-05-05** — Refactored [`hyperspectral_plan.md`](hyperspectral_plan.md)
+  presentation: each of the three stages now labels its approaches as
+  `v0`, `v1`, `v2`, … in order of increasing complexity, with explicit
+  _implemented_ vs _planned_ tags. Currently implemented working versions:
+  filter `v1` (hard-threshold heuristics), mosaic `v1` (first-write-wins),
+  gap-fill `v2` (IDW quadrant sweeps). Introduced an **additive evolution**
+  principle — older versions are never removed when a new one lands; they
+  coexist as user-selectable options so the user can fall back to a
+  simpler method if a complex one performs worse. Every version now
+  carries a short **"When to use / Limits"** note (1–3 bullets) intended
+  as the source of truth for tooltips on per-stage method dropdowns
+  (`FRAME_FILTER_METHOD`, `MOSAIC_METHOD`, `GAP_FILL_METHOD`) to be added
+  to the QGIS algorithms — the dropdown default is the most reliable
+  working version (current `v1`/`v2`), not the most advanced. Added a
+  matching cross-cutting item to **Pipeline TO-DO** ("Method-selection
+  UX") capturing the enum-per-stage requirement and the never-remove
+  rule. No code changed; documentation-only refactor.
+
+- **2026-05-05** — Method-selection UX scaffolding: implemented the
+  first TO-DO item from [`hyperspectral_plan.md`](hyperspectral_plan.md:419).
+  - **Added:** [`methods.py`](methods.py) — three plain-Python registries
+    (`FRAME_FILTER_METHODS`, `MOSAIC_METHODS`, `GAP_FILL_METHODS`); each
+    is a list of dicts with `id` / `label` / `tooltip` / `func`.
+    Today each list has exactly one entry pointing to the existing
+    implementation ([`frame_filter.filter_frames`](frame_filter.py:154),
+    [`mosaic.mosaic_frames`](mosaic.py:96),
+    [`fill_nodata.fill_nodata_file`](fill_nodata.py:1)).
+    Tooltips are taken verbatim from the "When to use / Limits" bullets
+    in [`hyperspectral_plan.md`](hyperspectral_plan.md:1). Two helpers
+    [`labels()`](methods.py:1) and [`tooltip_block()`](methods.py:1)
+    render dropdown options + concatenated help for the QGIS dialog.
+  - **Modified:** all four algorithm files now expose a
+    `QgsProcessingParameterEnum` per stage with default index 0 (the
+    only currently-implemented version):
+    [`frame_filter_algorithm.py`](frame_filter_algorithm.py:1) → adds
+    `FRAME_FILTER_METHOD`; [`mosaic_algorithm.py`](mosaic_algorithm.py:1)
+    → adds `MOSAIC_METHOD`; [`gaps_filler_algorithm.py`](gaps_filler_algorithm.py:1)
+    → adds `GAP_FILL_METHOD`; [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py:1)
+    → adds all three. `processAlgorithm` in each file reads the enum
+    index, looks up the matching registry entry, logs `method["id"]`,
+    and calls `entry["func"](...)` instead of the previous hard-coded
+    function. The hyperspectral algorithm still delegates the actual
+    work to [`pipeline.run_pipeline()`](pipeline.py:32) (whose internal
+    callables match the registry entries today); the registry lookup is
+    the future plug-point once the pipeline learns to take method
+    callables as kwargs. Help text on each enum param is set via
+    `setHelp(methods.tooltip_block(...))` so the user sees the
+    "When to use / Limits" copy in the QGIS dialog.
+  - **Behaviour:** byte-identical to before for the only available
+    option in each registry. No helper-function signatures changed; no
+    parameter names removed; no new tests added. Future v2/v3/...
+    versions plug in additively by appending to the matching list in
+    [`methods.py`](methods.py) — no UI churn required.
+
+- **2026-05-05** — Early input validation in
+  [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:34)
+  (Pipeline TO-DO item #2 from
+  [`hyperspectral_plan.md`](hyperspectral_plan.md:436)). Right after
+  collecting input layer paths and before any pipeline work starts,
+  the algorithm now calls [`mosaic.validate_inputs()`](mosaic.py:42)
+  and re-raises any [`MosaicInputError`](mosaic.py:33) as a
+  `QgsProcessingException` with a clear message. This means a
+  CRS / pixel-size / band-count / dtype mismatch fails in ~1 second
+  instead of after the full Stage A filter pass. Only
+  [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py) was
+  modified — added `mosaic` to the package import line and a small
+  validation block in `processAlgorithm()`. Scope is limited to the
+  end-to-end pipeline algorithm per the TO-DO bullet; the standalone
+  Stage B [`MosaicAlgorithm`](mosaic_algorithm.py:20) already calls
+  `validate_inputs` inside [`mosaic_frames()`](mosaic.py:96), and the
+  Stage A / Stage C standalone algorithms operate on inputs that need
+  not be mutually compatible. No registry, signature or method-list
+  change in [`methods.py`](methods.py); behaviour for valid inputs is
+  unchanged.
+
+- **2026-05-05** — Capped open file descriptors in
+[`mosaic.mosaic_frames()`](mosaic.py:103) (Pipeline TO-DO item #3
+from [`hyperspectral_plan.md`](hyperspectral_plan.md:440)). Previously
+every input frame was opened simultaneously per band, which fails on
+Windows above ~500 frames (default fd limit). The per-band loop now
+splits the input list into chunks of `_MAX_OPEN_SOURCES = 256`,
+runs [`rasterio.merge.merge`](mosaic.py:185) on each chunk, and folds
+the chunk arrays together with `combined[isnan] = chunk[isnan]` —
+identical first-write-wins semantics across the full path list while
+never holding more than 256 source readers open at once. Public API,
+helper signatures and method registries are unchanged; with ≤ 256
+inputs the result is byte-identical to the previous code path. Only
+[`mosaic.py`](mosaic.py) was modified.
+
+- **2026-05-05** — Detect & abort on all-NaN bands in
+  [`pipeline.run_pipeline()`](pipeline.py:89) (Pipeline TO-DO item #4
+  from [`hyperspectral_plan.md`](hyperspectral_plan.md:443)). Inside
+  the per-band gap-fill loop, after reading each band, the pipeline
+  now checks `np.isfinite(arr).any()` and raises a `RuntimeError`
+  naming the band index when no valid pixel exists. Previously a
+  fully-corrupted band would be passed to
+  [`fill_nodata.fill_nodata()`](fill_nodata.py:1), which has no valid
+  samples to interpolate from and could either return the same all-NaN
+  array or hit a divide-by-zero — silently masking a broken input as a
+  successful run. Only [`pipeline.py`](pipeline.py) was modified; no
+  helper signatures, method registries, public APIs or default
+  behaviour for healthy inputs changed.
+
+- **2026-05-05** — Plan / pipeline housekeeping pass.
+  - **Plan ([`hyperspectral_plan.md`](hyperspectral_plan.md:1)).** Marked
+    Pipeline TO-DO items #1–#4 as `[x]` done with a `(done 2026-05-05)`
+    trailing tag: Method-selection UX (#1), early input validation
+    (#2), capped open file descriptors in
+    [`mosaic.mosaic_frames()`](mosaic.py:1) (#3) and the all-NaN-band
+    abort in [`pipeline.run_pipeline()`](pipeline.py:1) (#4). All other
+    items still show `[ ]` so future runs can tick them off.
+  - **Implemented Pipeline TO-DO item #5: handle CRS mismatch with
+    optional reprojection.** New optional kwarg
+    `reproject_to_first: bool = False` added to
+    [`mosaic.validate_inputs()`](mosaic.py:52),
+    [`mosaic.mosaic_frames()`](mosaic.py:169) and
+    [`pipeline.run_pipeline()`](pipeline.py:37); default `False`
+    reproduces the previous behaviour exactly (mismatch still raises
+    [`MosaicInputError`](mosaic.py:40)). When `True`,
+    [`validate_inputs()`](mosaic.py:52) tolerates CRS / pixel-size
+    differences (band count + dtype are still strict), and
+    [`mosaic_frames()`](mosaic.py:169) calls a small new helper
+    [`_reproject_to_reference()`](mosaic.py:118) that uses
+    [`rasterio.warp.calculate_default_transform`](https://rasterio.readthedocs.io/en/stable/api/rasterio.warp.html#rasterio.warp.calculate_default_transform)
+    + [`rasterio.warp.reproject`](https://rasterio.readthedocs.io/en/stable/api/rasterio.warp.html#rasterio.warp.reproject)
+    (bilinear) to write each mismatched frame to a temporary GeoTIFF
+    in the reference CRS / pixel grid; the existing band-streamed
+    first-write-wins merge then runs unchanged on the rewritten
+    `effective_paths` list, and the temp directory is cleaned up in a
+    `finally` block. Files modified: [`mosaic.py`](mosaic.py),
+    [`pipeline.py`](pipeline.py),
+    [`mosaic_algorithm.py`](mosaic_algorithm.py) (new
+    `REPROJECT_TO_FIRST` boolean parameter forwarded to the registry
+    call) and
+    [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py) (new
+    `REPROJECT_TO_FIRST` boolean parameter, threaded through the
+    early `validate_inputs()` and `pipeline.run_pipeline()` calls).
+    [`frame_filter_algorithm.py`](frame_filter_algorithm.py) and
+    [`gaps_filler_algorithm.py`](gaps_filler_algorithm.py) were left
+    untouched — they do not call `mosaic_frames()`, so adding a
+    reproject toggle there would be dead UI. Method-registry
+    signatures in [`methods.py`](methods.py) are unchanged (the kwarg
+    is forwarded by name through the registry callable). Verification:
+    `python3 -m py_compile` on every modified file → exit 0; `grep`
+    over `mosaic_frames|validate_inputs|run_pipeline` confirmed no
+    stale call sites.
+
+- **2026-05-05** — Plan / pipeline housekeeping pass.
+  - **Plan ([`hyperspectral_plan.md`](hyperspectral_plan.md:446)).** Marked
+    Pipeline TO-DO item #5 (Handle CRS mismatch with optional
+    reprojection) as `[x]` done with a `(done 2026-05-05)` trailing
+    tag — the work itself shipped in the previous changelog entry; this
+    pass only updates the checkbox so the plan reflects reality.
+  - **Implemented Pipeline TO-DO item #6: persist rejected-frames
+    report.** [`pipeline.run_pipeline()`](pipeline.py:87) now writes a
+    `<output>.rejected.csv` next to the final mosaic with columns
+    `path, reason, measured_value, threshold` for audit. The report is
+    written before the all-rejected guard so a user can inspect *why*
+    every frame was dropped without re-running Stage A. Two small
+    helpers were added to [`pipeline.py`](pipeline.py): a
+    [`_parse_reason()`](pipeline.py:44) regex pair that lifts the
+    measured value and threshold out of the existing reason strings
+    emitted by [`frame_filter.is_bad_frame()`](frame_filter.py:62)
+    (e.g. `"abnormal aspect ratio (ar=2.15 > 2.00)"` →
+    `("2.15", "2.00")`; the area check's `"allowed=[lo, hi]"` form is
+    rendered as a single bracketed string in the `threshold` column),
+    and a [`_write_rejected_report()`](pipeline.py:59) writer using the
+    stdlib `csv` module (no new dependency). When the reason text does
+    not match a known shape (future heuristic, unexpected text) the
+    `measured_value` / `threshold` columns stay empty and the full
+    reason string is still recorded. A `try/except OSError` around the
+    write keeps a disk failure from aborting the pipeline — the error
+    is logged via the existing `log` callback. Files modified:
+    [`pipeline.py`](pipeline.py) only. Helper signatures unchanged;
+    `run_pipeline()` signature, return dict, and default behaviour are
+    unchanged for the happy path. The four QGIS algorithms
+    ([`frame_filter_algorithm.py`](frame_filter_algorithm.py),
+    [`mosaic_algorithm.py`](mosaic_algorithm.py),
+    [`gaps_filler_algorithm.py`](gaps_filler_algorithm.py),
+    [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py)) needed
+    no changes — only the end-to-end pipeline runs Stage A through
+    `run_pipeline()`; the standalone Stage A
+    [`FrameFilterAlgorithm`](frame_filter_algorithm.py:24) already
+    writes its own text report via the existing `REPORT` parameter.
+    Verification: `python3 -m py_compile pipeline.py` → exit 0; manual
+    smoke test of `_parse_reason()` against all 5 reason shapes from
+    [`frame_filter.is_bad_frame()`](frame_filter.py:62) plus an
+    unknown-shape sample produced the expected `(measured, threshold)`
+    pairs and an empty fallback; `grep -rn run_pipeline` confirmed the
+    only call site is
+    [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py:295) and
+    its kwargs are untouched.
+
+- **2026-05-05** — Plan / pipeline housekeeping pass.
+  - **Plan ([`hyperspectral_plan.md`](hyperspectral_plan.md:449)).** Marked
+    Pipeline TO-DO item #6 (Persist rejected-frames report) as `[x]`
+    done with a `(done 2026-05-05)` trailing tag — the work itself
+    shipped in the previous changelog entry; this pass only updates
+    the checkbox so the plan reflects reality.
+  - **Implemented Pipeline TO-DO item #7: gap-fill v3 (`gdal.FillNodata`).**
+    Added [`fill_nodata.fill_nodata_file_gdal()`](fill_nodata.py:436),
+    a drop-in alternative to the existing
+    [`fill_nodata.fill_nodata_file()`](fill_nodata.py:305) (v2) with
+    the **same signature** so the gap-fill registry can dispatch to
+    either version without touching any algorithm wrapper. The new
+    function: opens the input read-only, defensively deletes any
+    pre-existing output file, uses `driver.CreateCopy` to seed the
+    output with the input's geometry / projection / dtype / per-band
+    nodata, then loops `for b in range(1, band_count + 1)` calling
+    [`gdal.FillNodata`](https://gdal.org/api/python/osgeo.gdal.html#osgeo.gdal.FillNodata)
+    on each output band in place. Each band's own `NoDataValue`
+    (preserved by `CreateCopy`) drives the validity mask when no
+    external mask is given; an external `mask_path` overrides it for
+    every band. Cancellation via `feedback.isCanceled()` is honoured
+    between bands. Per the plan ("keep v2 as the default fallback when
+    GDAL is unavailable or misbehaves"), the per-band loop is wrapped
+    in a `try/except`: any non-cancellation `Exception` from
+    `gdal.FillNodata` is logged and the function delegates to
+    [`fill_nodata.fill_nodata_file()`](fill_nodata.py:305) so the
+    algorithm still produces an output. Native C speed is reported as
+    10-100x faster than the pure-Python quadrant sweeps in
+    [`fill_nodata.fill_nodata()`](fill_nodata.py:156).
+  - **Registered v3 in [`methods.GAP_FILL_METHODS`](methods.py:70)** as
+    a second list entry (`id="v3_gdal_fillnodata"`,
+    `func=fill_nodata.fill_nodata_file_gdal`). v2 stays at index 0 so
+    the dropdown default is unchanged. Tooltip is the verbatim "When
+    to use / Limits" copy from the plan's gap-fill v3 section. Because
+    all four QGIS algorithms
+    ([`frame_filter_algorithm.py`](frame_filter_algorithm.py),
+    [`mosaic_algorithm.py`](mosaic_algorithm.py),
+    [`gaps_filler_algorithm.py`](gaps_filler_algorithm.py),
+    [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py))
+    already build their gap-fill enum from the registry via
+    [`methods.labels()`](methods.py:88) /
+    [`methods.tooltip_block()`](methods.py:93) and dispatch via
+    `entry["func"](...)`, no algorithm-file change was required and
+    the four files stay consistent. The standalone Stage C
+    [`FillNoDataAlgorithm`](gaps_filler_algorithm.py:22) now actually
+    routes through v3 when the user picks it; the end-to-end
+    [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:35)
+    still logs the chosen `gf_entry["id"]` but delegates fill to
+    [`pipeline.run_pipeline()`](pipeline.py:87) which uses the
+    array-level [`fill_nodata.fill_nodata()`](fill_nodata.py:156) by
+    design (call sites unchanged) — wiring the file-level v3 callable
+    through the pipeline orchestrator is deferred to a future TO-DO
+    along with the rest of the registry-driven dispatch refactor
+    flagged in [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py:307).
+  - **Files modified:** [`fill_nodata.py`](fill_nodata.py),
+    [`methods.py`](methods.py),
+    [`hyperspectral_plan.md`](hyperspectral_plan.md). No helper
+    signatures changed; no parameter names removed; default behaviour
+    is unchanged (v2 is still the default). `python3 -m py_compile` on
+    every modified `.py` exited 0; `grep -n "fill_nodata_file\|GAP_FILL_METHODS" *.py`
+    confirmed no stale call sites and the new function is wired only
+    via the registry.
+
+- **2026-05-05** — End-to-end pipeline now honours the gap-fill method
+  dropdown via registry-driven Stage C dispatch. Resolves the deferred
+  follow-up flagged at the end of Pipeline TO-DO item #7 in
+  [`hyperspectral_plan.md`](hyperspectral_plan.md): the combined
+  [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:35)
+  exposed the `GAP_FILL_METHOD` enum but
+  [`pipeline.run_pipeline()`](pipeline.py:128) hard-coded the array-level
+  [`fill_nodata.fill_nodata()`](fill_nodata.py:156) per-band loop, so the
+  user's choice was silently ignored.
+  - `run_pipeline()` gains exactly one new optional kwarg
+    `gap_fill_func=None`; when `None` it defaults to
+    [`fill_nodata.fill_nodata_file`](fill_nodata.py:305) (the v2 entry of
+    [`methods.GAP_FILL_METHODS`](methods.py:70)). All other public kwargs
+    are unchanged.
+  - Stage C is now a single file-level call:
+    `gap_fill_func(stage_b_path, final_output_path, mask_path=None,
+    max_search_dist=..., smoothing_iterations=..., feedback=...)`. The
+    Stage-B mosaic is materialised to `<output>.mosaic.tif` (which the
+    pipeline already wrote) and consumed from disk by Stage C.
+  - The all-NaN-band guard from TO-DO item #4 has been moved one step
+    earlier — it now scans the Stage-B mosaic on disk before Stage C is
+    invoked, so the abort message and behaviour stay identical
+    regardless of whether v2 (pure Python) or v3 (`gdal.FillNodata`)
+    runs the fill.
+  - [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:35)
+    now passes `gap_fill_func=gf_entry["func"]` into `run_pipeline()`;
+    selecting v3 from the dropdown actually invokes
+    [`fill_nodata.fill_nodata_file_gdal`](fill_nodata.py:436). The
+    standalone [`FillNoDataAlgorithm`](gaps_filler_algorithm.py:1) was
+    not touched (it already dispatches through the registry).
+  - **Default code path is byte-equivalent for v2:**
+    `fill_nodata_file` is itself a per-band loop that calls the same
+    array-level [`fill_nodata.fill_nodata()`](fill_nodata.py:156) with
+    the same `max_search_dist` and `smoothing_iterations` the pipeline
+    used before; nothing else in the new path touches pixel values.
+  - **Files modified:** [`pipeline.py`](pipeline.py),
+    [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py),
+    [`hyperspectral_plan.md`](hyperspectral_plan.md). Helper signatures
+    unchanged for `frame_filter.filter_frames`, `mosaic.mosaic_frames`,
+    `mosaic.validate_inputs`, `fill_nodata.fill_nodata` (array),
+    `fill_nodata.fill_nodata_file`, `fill_nodata.fill_nodata_file_gdal`.
+    `python3 -m py_compile pipeline.py hyperspectral_algorithm.py
+    fill_nodata.py methods.py` exited 0;
+    `grep -n "fill_nodata\.fill_nodata(" pipeline.py` returned no
+    matches (Stage C no longer calls the array fn directly);
+    `grep -n "gap_fill_func" pipeline.py hyperspectral_algorithm.py`
+    confirmed the kwarg is defined, defaulted, and passed end-to-end.

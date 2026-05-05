@@ -431,3 +431,137 @@ def fill_nodata_file(input_path, output_path,
             .format(written_bands, on_disk_bands))
         feedback.setProgress(100)
         feedback.pushInfo("Done.")
+
+
+def fill_nodata_file_gdal(input_path, output_path,
+                          mask_path=None, max_search_dist=10.0,
+                          smoothing_iterations=0, feedback=None):
+    """Fill nodata using native :func:`osgeo.gdal.FillNodata` (C-speed).
+
+    Drop-in v3 alternative to :func:`fill_nodata_file` (Pipeline TO-DO
+    item #7 in ``hyperspectral_plan.md``). Same signature so the gap-fill
+    method registry in :mod:`methods` can dispatch to either v2 or v3
+    without touching any algorithm wrapper.
+
+    The native C implementation is 10-100x faster than the pure-Python
+    quadrant-sweep IDW in :func:`fill_nodata` while running the same
+    family of algorithm (IDW from the four nearest valid neighbours).
+    Per-band: copy input -> output, then call ``gdal.FillNodata`` on the
+    output band in place. The band's own ``NoDataValue`` (preserved by
+    ``CreateCopy``) drives the validity mask when no external mask is
+    supplied; an external ``mask_path``'s first band overrides it for
+    every band of the cube (non-zero = valid).
+
+    If ``gdal.FillNodata`` raises for any reason during the per-band
+    loop, this wrapper logs the error via ``feedback`` and falls back
+    to :func:`fill_nodata_file` (the pure-Python v2 path) so the
+    algorithm still produces an output. Cancellation via ``feedback``
+    is honoured between bands.
+    """
+    from osgeo import gdal  # local import: keep plugin import-time light
+
+    if feedback is not None:
+        feedback.pushInfo("Opening input: {}".format(input_path))
+    src = gdal.Open(input_path, gdal.GA_ReadOnly)
+    if src is None:
+        raise IOError("Cannot open {}".format(input_path))
+
+    band_count = src.RasterCount
+    if band_count < 1:
+        raise ValueError("input raster has no bands")
+
+    # Optional external validity mask: the source raster's first band.
+    # gdal.FillNodata's ``maskBand`` parameter accepts a band object
+    # directly, so we keep the dataset alive for the whole loop.
+    mask_band = None
+    mask_ds = None
+    if mask_path:
+        if feedback is not None:
+            feedback.pushInfo("Reading mask: {}".format(mask_path))
+        mask_ds = gdal.Open(mask_path, gdal.GA_ReadOnly)
+        if mask_ds is None:
+            raise IOError("Cannot open mask {}".format(mask_path))
+        if (mask_ds.RasterXSize != src.RasterXSize
+                or mask_ds.RasterYSize != src.RasterYSize):
+            raise ValueError(
+                "mask size {}x{} does not match raster {}x{}".format(
+                    mask_ds.RasterXSize, mask_ds.RasterYSize,
+                    src.RasterXSize, src.RasterYSize))
+        mask_band = mask_ds.GetRasterBand(1)
+
+    if feedback is not None:
+        feedback.pushInfo("Creating output GeoTIFF: {}".format(output_path))
+    driver = gdal.GetDriverByName("GTiff")
+    # Same defensive delete as in :func:`fill_nodata_file` -- ``CreateCopy``
+    # alone does not always cleanly replace a pre-existing dataset that
+    # GDAL/QGIS still references on Windows.
+    if gdal.VSIStatL(output_path) is not None:
+        try:
+            driver.Delete(output_path)
+        except RuntimeError:
+            import os as _os
+            try:
+                _os.remove(output_path)
+            except OSError:
+                pass
+
+    # ``gdal.FillNodata`` modifies its target band in place, so we need a
+    # writable copy of the input as the destination. ``CreateCopy`` keeps
+    # geotransform, projection, dtype, band count and per-band nodata.
+    dst = driver.CreateCopy(output_path, src, strict=0)
+    if dst is None:
+        raise IOError("Cannot create {}".format(output_path))
+
+    if feedback is not None:
+        feedback.pushInfo(
+            "Filling {} band(s) with gdal.FillNodata".format(band_count))
+        feedback.setProgress(0)
+
+    try:
+        for b in range(1, band_count + 1):
+            if feedback is not None and feedback.isCanceled():
+                raise RuntimeError("canceled")
+            if feedback is not None:
+                feedback.pushInfo(
+                    "Band {}/{} (gdal.FillNodata)".format(b, band_count))
+            out_band = dst.GetRasterBand(b)
+            gdal.FillNodata(
+                targetBand=out_band,
+                maskBand=mask_band,
+                maxSearchDist=float(max_search_dist),
+                smoothingIterations=int(smoothing_iterations),
+            )
+            if feedback is not None:
+                feedback.setProgress(int(100 * b / band_count))
+    except RuntimeError:
+        # Cancellation -- propagate cleanly.
+        dst = None
+        src = None
+        mask_ds = None
+        raise
+    except Exception as exc:
+        # Per the plan ("keep v2 as the default fallback when GDAL is
+        # unavailable or misbehaves"), retry on the pure-Python path.
+        if feedback is not None:
+            feedback.pushInfo(
+                "gdal.FillNodata failed ({}); falling back to the "
+                "pure-Python v2 implementation.".format(exc))
+        dst = None
+        src = None
+        mask_ds = None
+        return fill_nodata_file(
+            input_path, output_path,
+            mask_path=mask_path,
+            max_search_dist=max_search_dist,
+            smoothing_iterations=smoothing_iterations,
+            feedback=feedback,
+        )
+
+    dst.FlushCache()
+    dst = None
+    src = None
+    mask_ds = None
+
+    if feedback is not None:
+        feedback.setProgress(100)
+        feedback.pushInfo("Done.")

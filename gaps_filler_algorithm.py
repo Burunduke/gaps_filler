@@ -10,12 +10,13 @@ from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessingAlgorithm,
     QgsProcessingException,
+    QgsProcessingParameterEnum,
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterDestination,
     QgsProcessingParameterRasterLayer,
 )
 
-from . import fill_nodata
+from . import methods
 
 
 class FillNoDataAlgorithm(QgsProcessingAlgorithm):
@@ -26,6 +27,7 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
     ITERATIONS = "ITERATIONS"
     MASK_LAYER = "MASK_LAYER"
     OUTPUT = "OUTPUT"
+    GAP_FILL_METHOD = "GAP_FILL_METHOD"
 
     # ---- Algorithm metadata ------------------------------------------------
 
@@ -95,6 +97,14 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
                 optional=True,
             )
         )
+        method_param = QgsProcessingParameterEnum(
+            self.GAP_FILL_METHOD,
+            self.tr("Gap fill method"),
+            options=methods.labels(methods.GAP_FILL_METHODS),
+            defaultValue=0,
+        )
+        method_param.setHelp(methods.tooltip_block(methods.GAP_FILL_METHODS))
+        self.addParameter(method_param)
         self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT, self.tr("Filled")
@@ -120,11 +130,16 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
         in_path = src_layer.source()
         mask_path = mask_lyr.source() if mask_lyr is not None else None
 
+        method_idx = self.parameterAsEnum(
+            parameters, self.GAP_FILL_METHOD, context)
+        method_entry = methods.GAP_FILL_METHODS[method_idx]
+        feedback.pushInfo(
+            "Gap fill method: {}".format(method_entry["id"]))
         feedback.pushInfo(
             "Filling all bands of {}".format(in_path))
 
         try:
-            fill_nodata.fill_nodata_file(
+            method_entry["func"](
                 input_path=in_path,
                 output_path=out_path,
                 mask_path=mask_path,

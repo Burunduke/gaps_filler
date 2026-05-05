@@ -10,11 +10,13 @@ from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
     QgsProcessingException,
+    QgsProcessingParameterBoolean,
+    QgsProcessingParameterEnum,
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterRasterDestination,
 )
 
-from . import mosaic
+from . import methods, mosaic
 
 
 class MosaicAlgorithm(QgsProcessingAlgorithm):
@@ -22,6 +24,8 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
 
     INPUT_LAYERS = "INPUT_LAYERS"
     OUTPUT = "OUTPUT"
+    MOSAIC_METHOD = "MOSAIC_METHOD"
+    REPROJECT_TO_FIRST = "REPROJECT_TO_FIRST"
 
     # ---- Algorithm metadata ------------------------------------------------
 
@@ -60,6 +64,22 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
                 layerType=QgsProcessing.TypeRaster,
             )
         )
+        method_param = QgsProcessingParameterEnum(
+            self.MOSAIC_METHOD,
+            self.tr("Mosaic method"),
+            options=methods.labels(methods.MOSAIC_METHODS),
+            defaultValue=0,
+        )
+        method_param.setHelp(methods.tooltip_block(methods.MOSAIC_METHODS))
+        self.addParameter(method_param)
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.REPROJECT_TO_FIRST,
+                self.tr("Reproject mismatched frames to the first frame's "
+                        "CRS / pixel size (instead of aborting)"),
+                defaultValue=False,
+            )
+        )
         self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT, self.tr("Mosaic output")
@@ -86,8 +106,24 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
             if message:
                 feedback.pushInfo(message)
 
+        method_idx = self.parameterAsEnum(
+            parameters, self.MOSAIC_METHOD, context)
+        method_entry = methods.MOSAIC_METHODS[method_idx]
+        feedback.pushInfo(
+            "Mosaic method: {}".format(method_entry["id"]))
+
+        reproject_to_first = self.parameterAsBoolean(
+            parameters, self.REPROJECT_TO_FIRST, context)
+        if reproject_to_first:
+            feedback.pushInfo(
+                "Reprojection of mismatched frames is enabled.")
+
         try:
-            mosaic.mosaic_frames(paths, out_path, progress=cb)
+            method_entry["func"](
+                paths, out_path,
+                progress=cb,
+                reproject_to_first=reproject_to_first,
+            )
         except QgsProcessingException:
             raise
         except mosaic.MosaicInputError as exc:
