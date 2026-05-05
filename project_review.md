@@ -384,3 +384,19 @@ The Processing Toolbox group **Hyperspectral gaps filler → Raster analysis** n
 - **"Hyperspectral pipeline (filter, mosaic, fill)"** ([`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:22)) — all three stages end-to-end.
 
 Use a single-stage algorithm when debugging a specific stage, plugging the plugin into a custom Model Builder workflow, or re-running just one step on already-prepared inputs. Use the end-to-end pipeline for normal use — pick raster layers as **Input frames**, set **Maximum distance** and **Smoothing iterations**, choose the **Filled mosaic** output path and run; the rejected-frame report appears in the Processing log.
+
+- **2026-05-05** — Added a mosaic-vs-reference quality assessment feature.
+  - **Added:** [`mosaic_quality.py`](mosaic_quality.py) — pure module (numpy + `osgeo.gdal`, no Qt) exposing [`compare_rasters(reference_path, mosaic_path, feedback=None)`](mosaic_quality.py:91) and [`format_report(summary)`](mosaic_quality.py:222). The function loops band-by-band (consistent with the per-band loop introduced in [`fill_nodata.py`](fill_nodata.py:305)) and returns a dict with per-band RMSE / MAE / PSNR / SSIM, plus the mean of each metric across bands.
+  - **Added:** [`mosaic_quality_algorithm.py`](mosaic_quality_algorithm.py) — [`MosaicQualityAlgorithm`](mosaic_quality_algorithm.py:21) registered as `gapsfiller:mosaic_quality` (display name "Mosaic quality (vs reference)", group "Raster analysis"). Parameters: `REFERENCE` and `MOSAIC` (`QgsProcessingParameterRasterLayer`). Outputs: `MEAN_RMSE`, `MEAN_MAE`, `MEAN_PSNR`, `MEAN_SSIM` (`QgsProcessingOutputNumber`); per-band values are reported as a readable table via `feedback.pushInfo`.
+  - **Modified:** [`gaps_filler_provider.py`](gaps_filler_provider.py:13) — registers the new algorithm alongside the existing four (`self.addAlgorithm(MosaicQualityAlgorithm())`).
+  - **Metric definitions.** All metrics are computed on **valid pixels only**, where `valid = (~ref_nodata_mask) & (~mos_nodata_mask)` (NaNs always count as nodata; per-band `GetNoDataValue()` from each raster drives the rest). Arrays are cast to `float64` before arithmetic. **RMSE** = `sqrt(mean((ref - mos)^2))`. **MAE** = `mean(|ref - mos|)`. **PSNR** = `20·log10(data_range) − 10·log10(MSE)` where `data_range = ref_max − ref_min` over the valid reference pixels; if `MSE == 0` or `data_range == 0` PSNR is reported as `inf` (logged). **SSIM** uses [`skimage.metrics.structural_similarity`](https://scikit-image.org/docs/stable/api/skimage.metrics.html#skimage.metrics.structural_similarity); SSIM needs full 2D arrays, so invalid pixels are filled with the reference mean in **both** images so the masked region cancels out. If scikit-image is missing, the algorithm fails with a clear "install scikit-image" message.
+  - **NoData handling.** The user explicitly said the mosaic edges are uneven, so nodata exclusion is the **only** spatial filtering — neither raster is cropped or aligned. Both rasters must already share grid (CRS / GeoTransform / size); a mismatch raises `ValueError` and is reported via `feedback.reportError(..., fatalError=True)`. Bands with zero valid overlapping pixels are skipped with a warning and excluded from the means; their indices are listed in the log under "Skipped bands".
+  - **Sample log table.** Per-band table format produced by [`format_report()`](mosaic_quality.py:222):
+    ```
+    Band |       RMSE |        MAE |       PSNR |       SSIM |   Valid px
+    -----+------------+------------+------------+------------+-----------
+       1 |    12.3456 |     8.9012 |    34.5678 |     0.9123 |    1048576
+       2 |    13.1111 |     9.4444 |    33.9999 |     0.9050 |    1048576
+    -----+------------+------------+------------+------------+-----------
+    MEAN |    12.7283 |     9.1728 |    34.2838 |     0.9087 |
+    ```

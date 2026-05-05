@@ -10,6 +10,7 @@ from .gaps_filler_algorithm import FillNoDataAlgorithm
 from .hyperspectral_algorithm import HyperspectralPipelineAlgorithm
 from .frame_filter_algorithm import FrameFilterAlgorithm
 from .mosaic_algorithm import MosaicAlgorithm
+from .mosaic_quality_algorithm import MosaicQualityAlgorithm
 
 
 class GapsFillerProvider(QgsProcessingProvider):
@@ -30,3 +31,4 @@ class GapsFillerProvider(QgsProcessingProvider):
         self.addAlgorithm(HyperspectralPipelineAlgorithm())
         self.addAlgorithm(FrameFilterAlgorithm())
         self.addAlgorithm(MosaicAlgorithm())
+        self.addAlgorithm(MosaicQualityAlgorithm())
