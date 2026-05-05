@@ -16,9 +16,24 @@ from qgis.core import (
     QgsProcessingParameterFileDestination,
     QgsProcessingParameterFolderDestination,
     QgsProcessingParameterMultipleLayers,
+    QgsProcessingParameterNumber,
 )
 
 from . import frame_filter
+from .frame_filter import (
+    AREA_HI,
+    AREA_LO,
+    ASPECT_MAX,
+    CENTRE_WINDOW,
+    FilterThresholds,
+    MIN_VALID_FRACTION,
+    SATURATION_FRACTION,
+    SKEW_MAX,
+    STD_MIN,
+)
+
+
+_LOG_CAP = 1000
 
 
 class FrameFilterAlgorithm(QgsProcessingAlgorithm):
@@ -27,6 +42,15 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
     INPUT_LAYERS = "INPUT_LAYERS"
     OUTPUT_FOLDER = "OUTPUT_FOLDER"
     REPORT = "REPORT"
+
+    SKEW_MAX = "SKEW_MAX"
+    AREA_LO = "AREA_LO"
+    AREA_HI = "AREA_HI"
+    ASPECT_MAX = "ASPECT_MAX"
+    CENTRE_WINDOW = "CENTRE_WINDOW"
+    MIN_VALID_FRACTION = "MIN_VALID_FRACTION"
+    STD_MIN = "STD_MIN"
+    SATURATION_FRACTION = "SATURATION_FRACTION"
 
     # ---- Algorithm metadata ------------------------------------------------
 
@@ -58,6 +82,9 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
     # ---- Parameters --------------------------------------------------------
 
     def initAlgorithm(self, config=None):
+        Double = QgsProcessingParameterNumber.Double
+        Integer = QgsProcessingParameterNumber.Integer
+
         self.addParameter(
             QgsProcessingParameterMultipleLayers(
                 self.INPUT_LAYERS,
@@ -81,6 +108,43 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        self.addParameter(QgsProcessingParameterNumber(
+            self.SKEW_MAX, self.tr("Max skew (rotation tolerance)"),
+            type=Double, defaultValue=SKEW_MAX, minValue=0.0, maxValue=1.0))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.AREA_LO,
+            self.tr("Min area ratio vs. flight median"),
+            type=Double, defaultValue=AREA_LO, minValue=0.0, maxValue=1.0))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.AREA_HI,
+            self.tr("Max area ratio vs. flight median"),
+            type=Double, defaultValue=AREA_HI, minValue=1.0, maxValue=10.0))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.ASPECT_MAX,
+            self.tr("Max aspect ratio (long / short side)"),
+            type=Double, defaultValue=ASPECT_MAX,
+            minValue=1.0, maxValue=10.0))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.CENTRE_WINDOW,
+            self.tr("Centre window size (pixels)"),
+            type=Integer, defaultValue=CENTRE_WINDOW,
+            minValue=4, maxValue=4096))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.MIN_VALID_FRACTION,
+            self.tr("Min fraction of valid pixels in centre"),
+            type=Double, defaultValue=MIN_VALID_FRACTION,
+            minValue=0.0, maxValue=1.0))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.STD_MIN,
+            self.tr("Min std-dev of centre (low-variance reject)"),
+            type=Double, defaultValue=STD_MIN,
+            minValue=0.0, maxValue=1e6))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.SATURATION_FRACTION,
+            self.tr("Max saturated-pixel fraction in centre"),
+            type=Double, defaultValue=SATURATION_FRACTION,
+            minValue=0.0, maxValue=1.0))
+
     # ---- Execution ---------------------------------------------------------
 
     def processAlgorithm(self, parameters, context, feedback):
@@ -95,12 +159,45 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
         report_path = self.parameterAsFileOutput(
             parameters, self.REPORT, context)
 
+        thresholds = FilterThresholds(
+            skew_max=self.parameterAsDouble(
+                parameters, self.SKEW_MAX, context),
+            area_lo=self.parameterAsDouble(
+                parameters, self.AREA_LO, context),
+            area_hi=self.parameterAsDouble(
+                parameters, self.AREA_HI, context),
+            aspect_max=self.parameterAsDouble(
+                parameters, self.ASPECT_MAX, context),
+            centre_window=self.parameterAsInt(
+                parameters, self.CENTRE_WINDOW, context),
+            min_valid_fraction=self.parameterAsDouble(
+                parameters, self.MIN_VALID_FRACTION, context),
+            std_min=self.parameterAsDouble(
+                parameters, self.STD_MIN, context),
+            saturation_fraction=self.parameterAsDouble(
+                parameters, self.SATURATION_FRACTION, context),
+        )
+
         paths = [lyr.source() for lyr in layers]
 
         try:
-            good, rejected = frame_filter.filter_frames(paths)
+            good, rejected = frame_filter.filter_frames(
+                paths, thresholds=thresholds)
         except Exception as exc:
             raise QgsProcessingException(str(exc))
+
+        # Log every rejected frame so the user sees WHY each was dropped.
+        for i, (p, reason) in enumerate(rejected):
+            if i >= _LOG_CAP:
+                feedback.pushInfo(
+                    "... and {} more rejected (see report file)".format(
+                        len(rejected) - _LOG_CAP))
+                break
+            feedback.pushInfo(
+                "REJECTED  {}: {}".format(os.path.basename(p), reason))
+
+        feedback.pushInfo(
+            "Kept {} / {} frames".format(len(good), len(paths)))
 
         os.makedirs(folder, exist_ok=True)
 

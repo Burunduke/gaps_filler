@@ -23,9 +23,14 @@ from . import fill_nodata, frame_filter, mosaic
 
 
 _ProgressCb = Callable[[float, str], None]
+_LogCb = Callable[[str], None]
 
 
 def _noop(fraction: float, message: str) -> None:
+    return None
+
+
+def _noop_log(message: str) -> None:
     return None
 
 
@@ -33,15 +38,22 @@ def run_pipeline(
     input_paths: list[str],
     output_path: str,
     *,
+    thresholds: "frame_filter.FilterThresholds | None" = None,
     max_distance: int = 100,
     smoothing_iterations: int = 0,
     progress: Optional[_ProgressCb] = None,
+    log: Optional[_LogCb] = None,
 ) -> dict:
     """Run filter → mosaic → fill_nodata. Return a summary dict."""
     cb: _ProgressCb = progress if progress is not None else _noop
+    log_cb: _LogCb = log if log is not None else _noop_log
 
     # ---- Stage A: filter -------------------------------------------------
-    good, rejected = frame_filter.filter_frames(input_paths)
+    good, rejected = frame_filter.filter_frames(
+        input_paths, thresholds=thresholds)
+    for p, reason in rejected:
+        log_cb("REJECTED {}: {}".format(os.path.basename(p), reason))
+    log_cb("Kept {} / {} frames".format(len(good), len(input_paths)))
     if len(good) == 0:
         raise RuntimeError("all frames rejected by filter")
     cb(0.05, "filtered: {} kept, {} rejected".format(len(good), len(rejected)))
