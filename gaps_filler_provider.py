@@ -7,6 +7,7 @@ from qgis.core import QgsProcessingProvider
 # Make sure the compiled Qt resource (icon.png) is registered.
 from .resources import *  # noqa: F401,F403
 from .gaps_filler_algorithm import FillNoDataAlgorithm
+from .hyperspectral_algorithm import HyperspectralPipelineAlgorithm
 
 
 class GapsFillerProvider(QgsProcessingProvider):
@@ -24,3 +25,4 @@ class GapsFillerProvider(QgsProcessingProvider):
 
     def loadAlgorithms(self):
         self.addAlgorithm(FillNoDataAlgorithm())
+        self.addAlgorithm(HyperspectralPipelineAlgorithm())

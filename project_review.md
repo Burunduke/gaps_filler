@@ -317,3 +317,52 @@ Imports inside `fill_nodata.py`: `import numpy as np`, `from osgeo import gdal`.
 - **2026-05-03** — Fixed bug where the output raster contained all bands of the input instead of only the selected band. Root cause: [`fill_nodata_file()`](fill_nodata.py:305) used `driver.CreateCopy(output_path, src)`, which clones every source band; only the selected band was then overwritten with filled data, leaving the rest passed through. Replaced with `driver.Create(output_path, W, H, 1, dtype)` plus explicit `SetGeoTransform` / `SetProjection`, and writing the filled array to band 1. Output now matches GDAL `FillNodata` semantics: a single-band raster containing only the user-selected band.
 
 - **2026-05-03** — Follow-up fix: users still saw multi-band output after the previous change. Root cause this time was **distinct from the `CreateCopy` bug**: when the algorithm was re-run with the same output path, an existing multi-band file from a previous (buggy) run was already on disk and was already loaded into the QGIS canvas. `gdal.Driver.Create(path, W, H, 1, dtype)` does **not** robustly truncate a pre-existing dataset that GDAL/QGIS still holds a reference to (filesystem locks on Windows, GDAL block cache on the loaded layer), so the freshly-created "1-band" header could end up sitting on top of stale band data — QGIS continued to report the old band count. Fix in [`fill_nodata_file()`](fill_nodata.py:305): before `driver.Create`, explicitly call `driver.Delete(output_path)` (with an `os.remove` fallback) when the path already exists, then create the new single-band dataset. After write + `FlushCache` + `dst = None`, the file is re-opened read-only and its `RasterCount` is logged via `feedback.pushInfo` — this gives a hard, on-disk proof in the Processing log that exactly **1 band** was written. Also updated the now-stale wording in [`FillNoDataAlgorithm.shortHelpString()`](gaps_filler_algorithm.py:53) (it still claimed other bands were "copied as-is"). End-to-end justification that output is single-band: (a) any pre-existing file at `output_path` is deleted; (b) `driver.Create(..., 1, ...)` creates a fresh dataset with exactly one band; (c) only `dst.GetRasterBand(1).WriteArray(filled)` is called — no loop over bands anywhere in `fill_nodata.py`, `gaps_filler_algorithm.py` or `gaps_filler.py` (the GUI module only registers the provider, no alternate run path); (d) `FlushCache()` + `dst = None` finalize the write; (e) re-opening the file confirms `RasterCount == 1` and logs it.
+
+## Hyperspectral pipeline (added)
+
+### Goal
+
+Extend the plugin to process PIKA-L hyperspectral drone frames — a set of already-orthorectified per-frame GeoTIFFs sharing CRS and pixel size — into a single gap-filled mosaic. The new end-to-end Processing algorithm rejects obviously-bad frames, mosaics the survivors with a deterministic overlap rule, and fills NoData gaps in every band of the resulting cube. The implementation follows [`hyperspectral_plan.md`](hyperspectral_plan.md:1).
+
+### Pipeline
+
+```
+input rasters ──▶ filter ──▶ mosaic ──▶ fill_nodata ──▶ filled mosaic
+                  (Stage A)  (Stage B)   (Stage C)
+```
+
+### New modules
+
+- [`frame_filter.py`](frame_filter.py:1) — Stage A; per-frame heuristic rejection of bad PIKA-L frames using only `rasterio` + `numpy`. Public API: [`is_bad_frame()`](frame_filter.py:44) (single-frame check, returns `(is_bad, reason)`) and [`filter_frames()`](frame_filter.py:125) (batch wrapper that first computes the median footprint area, then dispatches; returns `(good_paths, rejected_pairs)`). Module-level threshold constants: [`SKEW_MAX`](frame_filter.py:29), [`AREA_LO`](frame_filter.py:30), [`AREA_HI`](frame_filter.py:31), [`ASPECT_MAX`](frame_filter.py:32), [`CENTRE_WINDOW`](frame_filter.py:33), [`MIN_VALID_FRACTION`](frame_filter.py:34), [`STD_MIN`](frame_filter.py:35), [`SATURATION_FRACTION`](frame_filter.py:36).
+- [`mosaic.py`](mosaic.py:1) — Stage B; band-streaming mosaic. Public API: [`MosaicInputError`](mosaic.py:33) (raised on incompatible inputs), [`validate_inputs()`](mosaic.py:42) (cross-frame CRS / pixel size / band count / dtype check, returns a summary dict), [`mosaic_frames()`](mosaic.py:96) (writes the mosaic; takes an optional `progress=callable(fraction, message)`). Output is **float32** with **NaN** as NoData; overlapping pixels follow **first-write-wins** (`rasterio.merge.merge` with `method="first"`); container is a tiled, deflate-compressed BigTIFF (512×512 blocks).
+- [`pipeline.py`](pipeline.py:1) — Stage C orchestrator that chains A → B → C. Public API: [`run_pipeline(input_paths: list[str], output_path: str, *, max_distance: int = 100, smoothing_iterations: int = 0, progress: Optional[Callable[[float, str], None]] = None) -> dict`](pipeline.py:32). The returned dict carries `input_count`, `kept_count`, `rejected` (list of `(path, reason)`), `output_path`, and `band_count`.
+- [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py:1) — QGIS Processing wrapper. [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:22) registers as `gapsfiller:hyperspectral_pipeline` (display name "Hyperspectral pipeline (filter, mosaic, fill)", group "Raster analysis"). Four parameters: [`INPUT_LAYERS`](hyperspectral_algorithm.py:25) (`QgsProcessingParameterMultipleLayers`, raster), [`MAX_DISTANCE`](hyperspectral_algorithm.py:26) (integer, default `100`, min `1`), [`SMOOTHING_ITERATIONS`](hyperspectral_algorithm.py:27) (integer, default `0`, min `0`), [`OUTPUT`](hyperspectral_algorithm.py:28) (`QgsProcessingParameterRasterDestination`).
+
+### Existing files touched
+
+Exactly two lines were added in [`gaps_filler_provider.py`](gaps_filler_provider.py:1): an `import` of [`HyperspectralPipelineAlgorithm`](gaps_filler_provider.py:10) and a matching [`self.addAlgorithm(...)`](gaps_filler_provider.py:28) call inside `loadAlgorithms()`. No other existing file was modified. [`fill_nodata.fill_nodata`](fill_nodata.py:1) is reused **unchanged at the array level** — `pipeline.py` reads each mosaic band into a numpy array, calls it directly, and writes the filled array back, avoiding a per-band GDAL round-trip.
+
+### Locked decisions
+
+- **Dependency:** `rasterio` is allowed alongside `osgeo.gdal`; the new modules use `rasterio` exclusively, the existing `fill_nodata.py` keeps using `osgeo.gdal`.
+- **NoData:** taken as-is from the source frames (`src.nodata`); the mosaic and final output use **NaN** as NoData.
+- **Output dtype:** **float32**, regardless of source dtype.
+- **CRS / pixel size:** must match across all input frames. [`validate_inputs()`](mosaic.py:42) aborts with [`MosaicInputError`](mosaic.py:33) on any mismatch — there is **no reprojection** in v1.
+- **Overlap handling:** **first-write-wins** via [`rasterio.merge.merge`](mosaic.py:164) with `method="first"`.
+- **Memory:** band-by-band streaming throughout (Stages B and C), so the worst case stays bounded even for the ~280-band PIKA-L cubes.
+
+### Known limitations / next steps
+
+- No reprojection or resampling — incompatible CRS / pixel size aborts the run.
+- Frame-filter heuristics use static thresholds (module-level constants in [`frame_filter.py`](frame_filter.py:29)); per-flight tuning may be needed.
+- Overlap method is fixed to first-write-wins; no feathering or averaging yet.
+- No caching of intermediate mosaic — the temp file `<output>.mosaic.tif` is deleted after Stage C.
+- No tests added (per project policy).
+
+### How to use from QGIS
+
+- Open the **Processing Toolbox**.
+- Under **Hyperspectral gaps filler → Raster analysis**, pick **"Hyperspectral pipeline (filter, mosaic, fill)"**.
+- In the dialog, select multiple raster layers (the PIKA-L per-frame GeoTIFFs) for **Input frames**.
+- Set **Maximum distance** (search radius for gap fill, in pixels) and **Smoothing iterations**.
+- Choose the **Filled mosaic** output path and run; the rejected-frame report appears in the Processing log.
