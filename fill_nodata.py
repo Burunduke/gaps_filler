@@ -25,6 +25,80 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
+# Public helper — interior-hole mask
+# ---------------------------------------------------------------------------
+
+
+def write_interior_fill_mask(input_path: str, mask_path: str) -> None:
+    """Write a 0/1 uint8 mask co-registered with ``input_path``.
+
+    The mask is **0 only on interior holes** (NaN pixels enclosed by valid
+    data, across the union of bands) and **1 everywhere else** (valid
+    pixels and outside-footprint pixels). This single polarity works for
+    both gap-fill backends:
+
+      * v2 :func:`fill_nodata_file` reads ``mask != 0`` as the validity
+        mask and only fills pixels where ``mask == 0`` (it preserves the
+        original value -- NaN at outside-footprint -- where ``mask != 0``).
+      * v3 :func:`fill_nodata_file_gdal` forwards the mask to
+        :func:`osgeo.gdal.FillNodata` whose ``maskBand`` follows the same
+        convention: pixels with ``mask != 0`` are sources and never
+        modified; pixels with ``mask == 0`` are the targets to fill.
+
+    The validity mask is built band-by-band with ``np.logical_or`` so the
+    full cube never lives in memory at once.
+
+    ``rasterio`` is imported lazily so this module's top-level import
+    surface stays numpy-only (matches the historical promise in the
+    module docstring).
+    """
+    import rasterio  # lazy: keep top-level imports numpy-only
+
+    with rasterio.open(input_path) as src:
+        H, W = src.height, src.width
+        validity = np.zeros((H, W), dtype=bool)
+        for b in range(1, src.count + 1):
+            np.logical_or(validity, np.isfinite(src.read(b)), out=validity)
+        profile = {
+            "driver": "GTiff", "height": H, "width": W, "count": 1,
+            "dtype": "uint8", "transform": src.transform, "crs": src.crs,
+            "compress": "deflate",
+        }
+
+    # Interior holes = invalid pixels NOT reachable from the image border.
+    # Prefer scipy's binary_fill_holes; fall back to a pure-numpy 4-connected
+    # flood-fill from the border (project does not currently depend on
+    # scipy -- verified by grep).
+    invalid = ~validity
+    try:
+        from scipy.ndimage import binary_fill_holes
+        holes = binary_fill_holes(validity) & invalid
+    except ImportError:
+        outside = np.zeros_like(invalid)
+        outside[0, :] = invalid[0, :]
+        outside[-1, :] = invalid[-1, :]
+        outside[:, 0] = invalid[:, 0]
+        outside[:, -1] = invalid[:, -1]
+        prev = -1
+        while True:
+            cur = int(outside.sum())
+            if cur == prev:
+                break
+            prev = cur
+            new = outside.copy()
+            new[1:, :] |= outside[:-1, :]
+            new[:-1, :] |= outside[1:, :]
+            new[:, 1:] |= outside[:, :-1]
+            new[:, :-1] |= outside[:, 1:]
+            outside = new & invalid
+        holes = invalid & ~outside
+
+    mask = (~holes).astype(np.uint8)
+    with rasterio.open(mask_path, "w", **profile) as dst:
+        dst.write(mask, 1)
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 

@@ -6,17 +6,20 @@ that mirrors GDAL's "Fill nodata" tool, plus batch mode, history and
 "Run as Python command" — without us writing any Qt UI code.
 """
 
+import os
+
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessingAlgorithm,
     QgsProcessingException,
+    QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterDestination,
     QgsProcessingParameterRasterLayer,
 )
 
-from . import methods
+from . import fill_nodata, methods
 
 
 class FillNoDataAlgorithm(QgsProcessingAlgorithm):
@@ -28,6 +31,7 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
     MASK_LAYER = "MASK_LAYER"
     OUTPUT = "OUTPUT"
     GAP_FILL_METHOD = "GAP_FILL_METHOD"
+    FILL_ONLY_INTERIOR = "FILL_ONLY_INTERIOR"
 
     # ---- Algorithm metadata ------------------------------------------------
 
@@ -105,6 +109,19 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
         )
         method_param.setHelp(methods.tooltip_block(methods.GAP_FILL_METHODS))
         self.addParameter(method_param)
+        interior_param = QgsProcessingParameterBoolean(
+            self.FILL_ONLY_INTERIOR,
+            self.tr("Fill only interior holes (footprint-aware)"),
+            defaultValue=True,
+        )
+        interior_param.setHelp(self.tr(
+            "When ON, only fills holes that are surrounded by valid data. "
+            "Pixels outside the data footprint stay as NoData. Turn OFF "
+            "to fill toward the bounding box (legacy behaviour).\n\n"
+            "If you also supply a 'Validity mask' input, that mask takes "
+            "precedence and this checkbox is ignored."
+        ))
+        self.addParameter(interior_param)
         self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT, self.tr("Filled")
@@ -126,9 +143,11 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
             parameters, self.MASK_LAYER, context)
         out_path = self.parameterAsOutputLayer(
             parameters, self.OUTPUT, context)
+        fill_only_interior = self.parameterAsBoolean(
+            parameters, self.FILL_ONLY_INTERIOR, context)
 
         in_path = src_layer.source()
-        mask_path = mask_lyr.source() if mask_lyr is not None else None
+        user_mask_path = mask_lyr.source() if mask_lyr is not None else None
 
         method_idx = self.parameterAsEnum(
             parameters, self.GAP_FILL_METHOD, context)
@@ -137,6 +156,26 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
             "Gap fill method: {}".format(method_entry["id"]))
         feedback.pushInfo(
             "Filling all bands of {}".format(in_path))
+
+        # Mask dispatch:
+        #   * user-supplied mask wins (regardless of FILL_ONLY_INTERIOR);
+        #   * else FILL_ONLY_INTERIOR=True   -> auto-build interior mask;
+        #   * else FILL_ONLY_INTERIOR=False  -> mask_path=None (legacy).
+        auto_mask_path = None  # only set when we generate one to clean up
+        if user_mask_path is not None:
+            mask_path = user_mask_path
+            if fill_only_interior:
+                feedback.pushInfo(
+                    "User-supplied validity mask takes precedence over "
+                    "'Fill only interior holes'.")
+        elif fill_only_interior:
+            auto_mask_path = out_path + ".fillmask.tif"
+            feedback.pushInfo(
+                "Building interior-hole mask at {}".format(auto_mask_path))
+            fill_nodata.write_interior_fill_mask(in_path, auto_mask_path)
+            mask_path = auto_mask_path
+        else:
+            mask_path = None
 
         try:
             method_entry["func"](
@@ -155,5 +194,13 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(str(exc))
         except Exception as exc:
             raise QgsProcessingException(str(exc))
+        finally:
+            # Best-effort cleanup of the auto-generated mask (only the one
+            # we created -- never the user-supplied one).
+            if auto_mask_path is not None:
+                try:
+                    os.remove(auto_mask_path)
+                except OSError:
+                    pass
 
         return {self.OUTPUT: out_path}

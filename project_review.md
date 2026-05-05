@@ -767,3 +767,31 @@ inputs the result is byte-identical to the previous code path. Only
   `mosaic.validate_inputs`, `frame_filter.filter_frames`.
   `python3 -m py_compile pipeline.py hyperspectral_algorithm.py`
   exited 0.
+
+- **2026-05-05** — Footprint-aware gap-fill toggle in the standalone
+  Fill NoData algorithm. The interior-hole mask helper, previously
+  private as `pipeline._write_interior_fill_mask`, was promoted to a
+  public function
+  [`fill_nodata.write_interior_fill_mask`](fill_nodata.py:32)
+  (rasterio imported lazily so the module's top-level import surface
+  stays numpy-only). [`pipeline.py`](pipeline.py:1) now calls the
+  public helper; behaviour is byte-equivalent (same scipy-with-numpy
+  fallback, same 0/1 mask polarity).
+  [`FillNoDataAlgorithm`](gaps_filler_algorithm.py:1) gains a
+  `FILL_ONLY_INTERIOR` boolean parameter (default `True`). Mask
+  dispatch in `processAlgorithm`: a user-supplied validity mask always
+  wins (an info line is logged when the checkbox is also ON);
+  otherwise `FILL_ONLY_INTERIOR=True` builds an interior-hole mask
+  next to the output as `<output>.fillmask.tif` and forwards it as
+  `mask_path=`; otherwise `mask_path=None` is passed (today's legacy
+  behaviour reproduced byte-for-byte). The auto-generated mask is
+  removed in `finally` on success and on exception. **Files
+  modified:** [`fill_nodata.py`](fill_nodata.py:1),
+  [`pipeline.py`](pipeline.py:1),
+  [`gaps_filler_algorithm.py`](gaps_filler_algorithm.py:1),
+  [`hyperspectral_plan.md`](hyperspectral_plan.md:1). Helper
+  signatures unchanged for `fill_nodata.fill_nodata_file`,
+  `fill_nodata.fill_nodata_file_gdal`, `mosaic.mosaic_frames`,
+  `frame_filter.filter_frames`. `python3 -m py_compile
+  gaps_filler_algorithm.py fill_nodata.py pipeline.py
+  hyperspectral_algorithm.py methods.py` exited 0.
