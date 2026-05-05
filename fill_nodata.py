@@ -302,16 +302,19 @@ def fill_nodata(band,
     return out
 
 
-def fill_nodata_file(input_path, output_path, band_number=1,
+def fill_nodata_file(input_path, output_path,
                      mask_path=None, max_search_dist=10.0,
                      smoothing_iterations=0, feedback=None):
-    """Read one band of a raster, fill its nodata, write a single-band GeoTIFF.
+    """Fill nodata in **every** band of a raster and write a multi-band GeoTIFF.
 
-    Mirrors GDAL's ``FillNodata``: the output contains only the selected
-    band (FillNodata operates on a single band). If ``mask_path`` is
-    given, the first band of that raster is used as the validity mask
-    (non-zero = valid pixel); otherwise the band's own nodata value is
-    used. Geotransform, projection and nodata are preserved.
+    All bands of the input are processed with the same parameters; each
+    band keeps its own nodata value and is filled independently by
+    :func:`fill_nodata`. The output has the same band count, size,
+    geotransform and projection as the input.
+
+    If ``mask_path`` is given, the first band of that raster is used as
+    the validity mask (non-zero = valid pixel) for **all** bands;
+    otherwise each band's own nodata value drives its mask.
 
     GDAL is used only for I/O — the algorithm runs in :func:`fill_nodata`.
 
@@ -326,11 +329,13 @@ def fill_nodata_file(input_path, output_path, band_number=1,
     src = gdal.Open(input_path, gdal.GA_ReadOnly)
     if src is None:
         raise IOError("Cannot open {}".format(input_path))
-    if band_number < 1 or band_number > src.RasterCount:
-        raise ValueError("band_number {} out of range (raster has {} bands)"
-                         .format(band_number, src.RasterCount))
+
+    band_count = src.RasterCount
+    if band_count < 1:
+        raise ValueError("input raster has no bands")
 
     # Optional external validity mask: read first band, non-zero = valid.
+    # Shared across all bands.
     mask = None
     if mask_path:
         if feedback is not None:
@@ -346,18 +351,13 @@ def fill_nodata_file(input_path, output_path, band_number=1,
                                      (src.RasterYSize, src.RasterXSize)))
         mask = marr != 0
 
-    in_band = src.GetRasterBand(band_number)
-    arr = in_band.ReadAsArray()
-    nodata = in_band.GetNoDataValue()
-
     if feedback is not None:
         feedback.pushInfo("Creating output GeoTIFF: {}".format(output_path))
     driver = gdal.GetDriverByName("GTiff")
-    # If a previous (possibly multi-band) file exists at output_path,
-    # delete it first. driver.Create alone is not always enough to
-    # guarantee a clean replacement — on some platforms the existing
-    # dataset can stay partially live (cached by GDAL/QGIS), which is
-    # what made earlier "single-band" runs still appear multi-band.
+    # If a previous file exists at output_path, delete it first.
+    # driver.Create alone is not always enough to guarantee a clean
+    # replacement — on some platforms the existing dataset can stay
+    # partially live (cached by GDAL/QGIS).
     if gdal.VSIStatL(output_path) is not None:
         try:
             driver.Delete(output_path)
@@ -368,34 +368,53 @@ def fill_nodata_file(input_path, output_path, band_number=1,
                 os.remove(output_path)
             except OSError:
                 pass
-    # Single-band output (FillNodata operates on one band).
+
+    # Use the first band's data type for the whole output. Hyperspectral
+    # cubes (and basically every multi-band raster we care about) have
+    # uniform dtype across bands; fill_nodata casts back to the source
+    # dtype anyway, so any minor mismatch is a safe round-trip cast.
+    out_dtype = src.GetRasterBand(1).DataType
     dst = driver.Create(
         output_path,
         src.RasterXSize,
         src.RasterYSize,
-        1,
-        in_band.DataType,
+        band_count,
+        out_dtype,
     )
     dst.SetGeoTransform(src.GetGeoTransform())
     dst.SetProjection(src.GetProjection())
 
     if feedback is not None:
         feedback.pushInfo(
-            "Filling band {} (size {}x{}, nodata={})".format(
-                band_number, src.RasterXSize, src.RasterYSize, nodata))
+            "Filling {} band(s), size {}x{}".format(
+                band_count, src.RasterXSize, src.RasterYSize))
         feedback.setProgress(0)
 
-    filled = fill_nodata(
-        arr,
-        mask=mask,
-        max_search_dist=max_search_dist,
-        smoothing_iterations=smoothing_iterations,
-        nodata=nodata,
-        feedback=feedback,
-    )
-    dst.GetRasterBand(1).WriteArray(filled)
-    if nodata is not None:
-        dst.GetRasterBand(1).SetNoDataValue(nodata)
+    # Per-band fill loop. Each band gets its own nodata sentinel.
+    for b in range(1, band_count + 1):
+        in_band = src.GetRasterBand(b)
+        arr = in_band.ReadAsArray()
+        nodata = in_band.GetNoDataValue()
+
+        if feedback is not None:
+            feedback.pushInfo(
+                "Band {}/{} (nodata={})".format(b, band_count, nodata))
+
+        filled = fill_nodata(
+            arr,
+            mask=mask,
+            max_search_dist=max_search_dist,
+            smoothing_iterations=smoothing_iterations,
+            nodata=nodata,
+            feedback=feedback,
+        )
+        dst.GetRasterBand(b).WriteArray(filled)
+        if nodata is not None:
+            dst.GetRasterBand(b).SetNoDataValue(nodata)
+
+        if feedback is not None:
+            feedback.setProgress(int(100 * b / band_count))
+
     dst.FlushCache()
     written_bands = dst.RasterCount
     dst = None

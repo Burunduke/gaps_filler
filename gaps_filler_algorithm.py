@@ -10,7 +10,6 @@ from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessingAlgorithm,
     QgsProcessingException,
-    QgsProcessingParameterBand,
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterDestination,
     QgsProcessingParameterRasterLayer,
@@ -23,7 +22,6 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
     """Fill NoData pixels in a single raster band."""
 
     INPUT = "INPUT"
-    BAND = "BAND"
     DISTANCE = "DISTANCE"
     ITERATIONS = "ITERATIONS"
     MASK_LAYER = "MASK_LAYER"
@@ -52,14 +50,14 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
 
     def shortHelpString(self):
         return self.tr(
-            "Fills NoData gaps in a single raster band using a pure-Python "
+            "Fills NoData gaps in every band of a raster using a pure-Python "
             "re-implementation of GDAL's FillNodata: inverse-distance "
             "weighting from the four nearest valid pixels (one per spatial "
             "quadrant), followed by an optional 3x3 smoothing pass.\n\n"
             "Inputs: any GDAL-readable raster, plus an optional validity "
-            "mask (non-zero = valid). Output: a single-band GeoTIFF "
-            "containing only the processed band (matches GDAL FillNodata "
-            "semantics); geotransform, projection and nodata are preserved."
+            "mask (non-zero = valid). Output: a multi-band GeoTIFF with the "
+            "same band count, geotransform, projection and per-band nodata "
+            "as the input."
         )
 
     # ---- Parameters --------------------------------------------------------
@@ -68,14 +66,6 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterRasterLayer(
                 self.INPUT, self.tr("Input raster")
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterBand(
-                self.BAND,
-                self.tr("Band number"),
-                defaultValue=1,
-                parentLayerParameterName=self.INPUT,
             )
         )
         self.addParameter(
@@ -120,7 +110,6 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(
                 self.invalidRasterError(parameters, self.INPUT))
 
-        band = self.parameterAsInt(parameters, self.BAND, context)
         distance = self.parameterAsInt(parameters, self.DISTANCE, context)
         iters = self.parameterAsInt(parameters, self.ITERATIONS, context)
         mask_lyr = self.parameterAsRasterLayer(
@@ -132,13 +121,12 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
         mask_path = mask_lyr.source() if mask_lyr is not None else None
 
         feedback.pushInfo(
-            "Filling band {} of {}".format(band, in_path))
+            "Filling all bands of {}".format(in_path))
 
         try:
             fill_nodata.fill_nodata_file(
                 input_path=in_path,
                 output_path=out_path,
-                band_number=band,
                 mask_path=mask_path,
                 max_search_dist=float(distance),
                 smoothing_iterations=int(iters),
