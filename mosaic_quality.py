@@ -5,7 +5,8 @@ Pure module — no Qt / no QGIS imports — so it can be reused from any
 context. GDAL is used only for raster I/O, exactly as the rest of the
 plugin does. The heavy lifting happens in :func:`compare_rasters`,
 which loops band-by-band (consistent with the per-band loop in
-:mod:`fill_nodata`) and returns a dict of per-band and mean metrics.
+:mod:`fill_nodata`) and returns a dict of per-band and aggregate
+metrics.
 
 Metrics computed per band (over the intersection of validity masks):
 
@@ -16,8 +17,23 @@ Metrics computed per band (over the intersection of validity masks):
 - ``ssim``  -- structural similarity index, via
   :func:`skimage.metrics.structural_similarity` (scikit-image required).
 
+Aggregates across bands for each band-level metric: ``MEAN_<M>``,
+``WORST_<M>`` (max for lower-is-better, min for higher-is-better) and
+``P05_<M>`` ("5% of bands are at least this bad" — uses
+``np.percentile(values, 5)`` for higher-is-better metrics and
+``np.percentile(values, 95)`` for lower-is-better, so the polarity
+convention stays consistent regardless of metric direction).
+
+Whole-cube metric:
+
+- ``sam`` / ``sam_deg`` -- Spectral Angle Mapper (lower is better),
+  the mean angle (in radians / degrees) between reference and mosaic
+  pixel spectra over valid pixels. Captures spectral fidelity that
+  RMSE / PSNR / SSIM do not directly measure.
+
 NoData handling: pixels marked nodata in **either** the reference or
-the mosaic are excluded from every metric (mask intersection).
+the mosaic are excluded from every metric (mask intersection). For
+SAM a pixel must be valid in **every** band.
 
 Grid alignment: the mosaic typically covers a smaller extent than the
 reference orthophoto. To compare only the overlapping region, the
@@ -137,12 +153,52 @@ def _ssim_or_raise(ref_valid_2d, mos_valid_2d, data_range):
 
 
 # ---------------------------------------------------------------------------
+# Aggregation helpers
+# ---------------------------------------------------------------------------
+
+# Lower-is-better metrics flip the WORST/P05 reduction direction.
+_LOWER_IS_BETTER = {"rmse", "mae"}
+
+# Numerical guard for SAM's denominator (||p|| * ||q||).
+_SAM_EPS = 1e-12
+
+
+def _aggregate_band_metric(values, key):
+    """Return ``(mean, worst, p05)`` for a per-band metric.
+
+    - ``WORST`` = max for lower-is-better metrics (RMSE, MAE), min for
+      higher-is-better metrics (PSNR, SSIM).
+    - ``P05`` always means "5% of bands are at least this bad"
+      regardless of polarity:
+        * higher-is-better → ``np.percentile(values, 5)`` (near-worst
+          small value);
+        * lower-is-better  → ``np.percentile(values, 95)`` (near-worst
+          large value).
+
+    With all-equal inputs ``MEAN == WORST == P05`` exactly, by
+    construction (numpy.percentile of a constant array returns that
+    constant).
+    """
+    if not values:
+        return float("nan"), float("nan"), float("nan")
+    arr = np.asarray(values, dtype=np.float64)
+    mean_v = float(arr.mean())
+    if key in _LOWER_IS_BETTER:
+        worst_v = float(arr.max())
+        p05_v = float(np.percentile(arr, 95))
+    else:
+        worst_v = float(arr.min())
+        p05_v = float(np.percentile(arr, 5))
+    return mean_v, worst_v, p05_v
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
 def compare_rasters(reference_path, mosaic_path, feedback=None):
-    """Compute per-band RMSE / MAE / PSNR / SSIM and their means.
+    """Compute per-band RMSE / MAE / PSNR / SSIM plus aggregates and SAM.
 
     Parameters
     ----------
@@ -162,8 +218,11 @@ def compare_rasters(reference_path, mosaic_path, feedback=None):
             "per_band": [{"band": i, "rmse": .., "mae": .., "psnr": ..,
                           "ssim": .., "valid_pixels": int}, ...],
             "skipped_bands": [int, ...],
-            "mean_rmse": float, "mean_mae": float,
-            "mean_psnr": float, "mean_ssim": float,
+            "mean_<m>", "worst_<m>", "p05_<m>" for m in
+                {rmse, mae, psnr, ssim},
+            "sam": float,        # whole-cube SAM in radians, lower is better
+            "sam_deg": float,    # same metric, in degrees
+            "sam_valid_pixels": int,
         }``
 
     Raises
@@ -197,6 +256,19 @@ def compare_rasters(reference_path, mosaic_path, feedback=None):
     per_band = []
     skipped = []
 
+    # SAM (Spectral Angle Mapper) is a whole-cube metric. To avoid
+    # re-reading the rasters, accumulate per-pixel dot product and
+    # squared norms inside the existing per-band loop. A pixel counts
+    # for SAM only if it is valid in EVERY band (intersection across
+    # bands of the same per-pixel valid mask the band-level metrics
+    # already use), so we also AND a running validity mask.
+    H = mos.RasterYSize
+    W = mos.RasterXSize
+    sam_dot = np.zeros((H, W), dtype=np.float64)
+    sam_p_sq = np.zeros((H, W), dtype=np.float64)
+    sam_q_sq = np.zeros((H, W), dtype=np.float64)
+    sam_valid_all = np.ones((H, W), dtype=bool)
+
     for b in range(1, band_count + 1):
         if feedback is not None:
             feedback.pushInfo("Comparing band {}/{}".format(b, band_count))
@@ -214,6 +286,16 @@ def compare_rasters(reference_path, mosaic_path, feedback=None):
         mos_nd = mb.GetNoDataValue()
         valid = (~_nodata_mask(ref_arr, ref_nd)) & \
                 (~_nodata_mask(mos_arr, mos_nd))
+        # Also exclude any non-finite values (NaN/inf) so SAM math is
+        # well-defined on every pixel that survives the AND below.
+        valid = valid & np.isfinite(ref_f) & np.isfinite(mos_f)
+
+        # Accumulate SAM components on the union of valid pixels in
+        # this band; the cross-band intersection is applied at the end.
+        sam_dot += np.where(valid, ref_f * mos_f, 0.0)
+        sam_p_sq += np.where(valid, ref_f * ref_f, 0.0)
+        sam_q_sq += np.where(valid, mos_f * mos_f, 0.0)
+        sam_valid_all &= valid
 
         n = int(valid.sum())
         if n == 0:
@@ -267,23 +349,43 @@ def compare_rasters(reference_path, mosaic_path, feedback=None):
             "valid_pixels": n,
         })
 
-    # Means: average across bands that produced numbers; ignore inf in
-    # PSNR mean only if every band is inf (then mean is inf).
-    def _mean(key):
-        vals = [m[key] for m in per_band]
-        if not vals:
-            return float("nan")
-        return float(sum(vals) / len(vals))
-
+    # ----- Per-band aggregates (mean / worst / p05) ------------------------
     summary = {
         "band_count": band_count,
         "per_band": per_band,
         "skipped_bands": skipped,
-        "mean_rmse": _mean("rmse") if per_band else float("nan"),
-        "mean_mae": _mean("mae") if per_band else float("nan"),
-        "mean_psnr": _mean("psnr") if per_band else float("nan"),
-        "mean_ssim": _mean("ssim") if per_band else float("nan"),
     }
+    for key in ("rmse", "mae", "psnr", "ssim"):
+        vals = [m[key] for m in per_band]
+        mean_v, worst_v, p05_v = _aggregate_band_metric(vals, key)
+        summary["mean_" + key] = mean_v
+        summary["worst_" + key] = worst_v
+        summary["p05_" + key] = p05_v
+
+    # ----- Whole-cube SAM --------------------------------------------------
+    # angle(p, q) = arccos( clip( dot(p, q) / (||p|| * ||q|| + eps),
+    #                              -1, 1 ) )
+    # Only pixels valid in every band, with non-zero norms in both p and q.
+    p_norm = np.sqrt(sam_p_sq)
+    q_norm = np.sqrt(sam_q_sq)
+    sam_pixel_valid = sam_valid_all & (p_norm > 0.0) & (q_norm > 0.0)
+    n_sam = int(sam_pixel_valid.sum())
+    if n_sam > 0:
+        denom = p_norm[sam_pixel_valid] * q_norm[sam_pixel_valid] + _SAM_EPS
+        cos_theta = sam_dot[sam_pixel_valid] / denom
+        cos_theta = np.clip(cos_theta, -1.0, 1.0)
+        angles = np.arccos(cos_theta)
+        sam_rad = float(np.mean(angles))
+    else:
+        sam_rad = float("nan")
+        if feedback is not None:
+            feedback.pushWarning(
+                "SAM: no pixel is valid in every band — SAM set to NaN.")
+    summary["sam"] = sam_rad
+    summary["sam_deg"] = float(math.degrees(sam_rad)) if n_sam > 0 \
+        else float("nan")
+    summary["sam_valid_pixels"] = n_sam
+
     return summary
 
 
@@ -291,10 +393,15 @@ def format_report(summary):
     """Render the result of :func:`compare_rasters` as a plain-text table.
 
     Returned string is multi-line and ready for ``feedback.pushInfo``.
+    Aggregate row order, per metric: ``MEAN_<M>``, ``WORST_<M>``,
+    ``P05_<M>``. Final two rows: ``SAM`` (radians) and ``SAM_DEG``
+    (degrees).
     """
     lines = []
-    lines.append("Band |       RMSE |        MAE |       PSNR |       SSIM |   Valid px")
-    lines.append("-----+------------+------------+------------+------------+-----------")
+    lines.append(
+        "Band |       RMSE |        MAE |       PSNR |       SSIM |   Valid px")
+    lines.append(
+        "-----+------------+------------+------------+------------+-----------")
     for m in summary["per_band"]:
         lines.append(
             "{band:>4} | {rmse:>10.4f} | {mae:>10.4f} | {psnr:>10.4f} | "
@@ -304,9 +411,29 @@ def format_report(summary):
     if summary["skipped_bands"]:
         lines.append("Skipped bands (no valid overlap): {}".format(
             summary["skipped_bands"]))
-    lines.append("-----+------------+------------+------------+------------+-----------")
     lines.append(
-        "MEAN | {r:>10.4f} | {m:>10.4f} | {p:>10.4f} | {s:>10.4f} |".format(
-            r=summary["mean_rmse"], m=summary["mean_mae"],
-            p=summary["mean_psnr"], s=summary["mean_ssim"]))
+        "-----+------------+------------+------------+------------+-----------")
+
+    # Aggregates per metric in the documented order: MEAN, WORST, P05.
+    # P05 means "5% of bands are at least this bad" regardless of polarity
+    # (higher-is-better → 5th pct; lower-is-better → 95th pct).
+    def _row(label, prefix):
+        return ("{lbl:>5} | {r:>10.4f} | {m:>10.4f} | {p:>10.4f} | "
+                "{s:>10.4f} |").format(
+            lbl=label,
+            r=summary[prefix + "_rmse"],
+            m=summary[prefix + "_mae"],
+            p=summary[prefix + "_psnr"],
+            s=summary[prefix + "_ssim"])
+
+    lines.append(_row("MEAN", "mean"))
+    lines.append(_row("WORST", "worst"))
+    lines.append(_row("P05", "p05"))
+
+    # SAM is a single whole-cube scalar (lower is better).
+    lines.append(
+        "-----+------------+------------+------------+------------+-----------")
+    lines.append("SAM     (rad) : {:.6f}   [{} pixels valid in every band]"
+                 .format(summary["sam"], summary["sam_valid_pixels"]))
+    lines.append("SAM_DEG (deg) : {:.6f}".format(summary["sam_deg"]))
     return "\n".join(lines)

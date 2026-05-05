@@ -831,3 +831,68 @@ inputs the result is byte-identical to the previous code path. Only
   `python3 -m py_compile fill_nodata.py pipeline.py
   gaps_filler_algorithm.py hyperspectral_algorithm.py methods.py`
   exited 0.
+
+## Quality benchmarks
+
+### 2026-05-05 — Footprint-aware gap-fill: strict topological mask vs. morphological closing
+
+Context: same hyperspectral flight dataset; the only difference between the two runs is the gap-fill mask construction (strict `binary_fill_holes` → `binary_fill_holes ∪ binary_closing(N=50)`, i.e. [`fill_nodata.write_interior_fill_mask()`](fill_nodata.py:62) with `max_gap_px=0` vs. `MAX_INTERIOR_GAP_PX=50`); all other parameters held equal.
+
+| Metric    | Before        | After         | Δ (After − Before)        |
+|-----------|---------------|---------------|---------------------------|
+| MEAN_RMSE | 0.07097884    | 0.00387872    | −0.06710012 (improved)    |
+| MEAN_MAE  | 0.01861339    | 0.00060489    | −0.01800850 (improved)    |
+| MEAN_PSNR | 28.21847672   | 51.41162463   | +23.19314791 (improved)   |
+| MEAN_SSIM | 0.93811815    | 0.99524193    | +0.05712378 (improved)    |
+
+Legend: RMSE / MAE — lower is better; PSNR / SSIM — higher is better.
+
+- **2026-05-05** — Mosaic Quality now reports `WORST_<M>` and `P05_<M>`
+  for each band-level metric, plus whole-cube `SAM` / `SAM_DEG`. Aim:
+  surface worst-band issues that the mean alone hides; SAM measures
+  spectral fidelity which RMSE/PSNR/SSIM don't directly capture.
+  - **Modified:** [`mosaic_quality.py`](mosaic_quality.py:1) — added
+    `_aggregate_band_metric()` helper that emits `(mean, worst, p05)`
+    from a list of per-band values; ``WORST`` = `max` for lower-is-
+    better metrics (RMSE, MAE) and `min` for higher-is-better metrics
+    (PSNR, SSIM); ``P05`` always means "5% of bands are at least this
+    bad" regardless of polarity (`np.percentile(..,5)` for higher-is-
+    better, `np.percentile(..,95)` for lower-is-better). Added SAM as a
+    whole-cube metric: per-pixel dot product and norm-squared
+    accumulators are updated **inside the existing per-band loop** (no
+    extra raster read), then `arccos(clip(dot/(||p||·||q||+eps), -1, 1))`
+    is averaged over pixels that are valid in **every** band and have
+    non-zero norms in both spectra (`eps = 1e-12`). Lower is better;
+    reported in radians (`sam`) and degrees (`sam_deg`).
+    [`format_report()`](mosaic_quality.py:1) now prints, per metric,
+    the rows `MEAN`, `WORST`, `P05` in that order, followed by two
+    final lines `SAM` (rad) and `SAM_DEG` (deg).
+  - **Modified:** [`mosaic_quality_algorithm.py`](mosaic_quality_algorithm.py:1)
+    — exposed 14 outputs (4 metrics × {MEAN, WORST, P05} + SAM +
+    SAM_DEG) as `QgsProcessingOutputNumber`; `shortHelpString()`
+    documents the polarity convention for WORST/P05 and that SAM is
+    "lower is better".
+  - **Backwards-compat.** Existing `MEAN_<M>` rows / outputs are
+    produced from the same per-band lists as before via
+    `_aggregate_band_metric(..)[0] = float(arr.mean())` (equivalent to
+    the old `sum(vals)/len(vals)`), so their numeric values are
+    unchanged. The per-band table format is also unchanged — only the
+    aggregate footer grew.
+  - **Verification.** (1) `python3 -m py_compile mosaic_quality.py
+    mosaic_quality_algorithm.py` → exit 0. (2) Hand-trace tie case:
+    if every band reports the same RMSE = R, then `arr = [R, R, ...]`
+    gives `mean = R`, `max = R`, `np.percentile(arr, 95) = R`, so
+    `MEAN = WORST = P05 = R` — same logic for MAE/PSNR/SSIM with the
+    polarity-flipped reductions. (3) SAM formula sanity: identical
+    cubes → `dot = ||p||·||q||`, `cos θ = 1`, `arccos(1) = 0`, so
+    `SAM = 0 rad = 0°`. Orthogonal spectra → `dot = 0`, `cos θ = 0`,
+    `arccos(0) = π/2 ≈ 1.5708 rad ≈ 90°`. (4) No new dependencies —
+    only `numpy` and `osgeo.gdal` (already used by the module).
+  - **Constraints honoured.** Only [`mosaic_quality.py`](mosaic_quality.py:1)
+    and [`mosaic_quality_algorithm.py`](mosaic_quality_algorithm.py:1)
+    were touched. [`mosaic.py`](mosaic.py:1),
+    [`fill_nodata.py`](fill_nodata.py:1),
+    [`frame_filter.py`](frame_filter.py:1),
+    [`pipeline.py`](pipeline.py:1), [`methods.py`](methods.py:1) and
+    every other algorithm file are untouched.
+    [`hyperspectral_plan.md`](hyperspectral_plan.md:1) is unchanged.
