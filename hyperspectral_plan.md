@@ -513,6 +513,8 @@ commercial-grade tool. Ordered roughly by ROI.
   only touch interior holes (done 2026-05-05).
   - [x] Standalone Fill NoData algorithm also exposes the toggle (done
     2026-05-05).
+  - [x] Bridge narrow / edge-touching gaps via morphological closing
+    (`MAX_INTERIOR_GAP_PX`, default 50) — done 2026-05-05.
 - [ ] **Add mosaic v4 (feathered blending)** in
   [`mosaic.py`](mosaic.py:1) as an opt-in `method="feather"` option in
   the new `MOSAIC_METHOD` dropdown. Adds `scipy` dep (already pulled by

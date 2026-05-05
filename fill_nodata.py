@@ -29,13 +29,43 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 
-def write_interior_fill_mask(input_path: str, mask_path: str) -> None:
+def _dilate4(a):
+    """One iteration of 4-connected binary dilation (pure numpy)."""
+    out = a.copy()
+    out[1:, :] |= a[:-1, :]
+    out[:-1, :] |= a[1:, :]
+    out[:, 1:] |= a[:, :-1]
+    out[:, :-1] |= a[:, 1:]
+    return out
+
+
+def _erode4(a):
+    """One iteration of 4-connected binary erosion (pure numpy).
+
+    Out-of-frame neighbours are treated as ``False`` so the border is
+    eroded inwards, matching :func:`scipy.ndimage.binary_erosion` with
+    ``border_value=0`` (its default).
+    """
+    out = a.copy()
+    out[1:, :] &= a[:-1, :]
+    out[:-1, :] &= a[1:, :]
+    out[:, 1:] &= a[:, :-1]
+    out[:, :-1] &= a[:, 1:]
+    # Edges lose their out-of-frame neighbour (= False); zero them out.
+    out[0, :] = False
+    out[-1, :] = False
+    out[:, 0] = False
+    out[:, -1] = False
+    return out
+
+
+def write_interior_fill_mask(input_path: str, mask_path: str,
+                             max_gap_px: int = 0) -> None:
     """Write a 0/1 uint8 mask co-registered with ``input_path``.
 
-    The mask is **0 only on interior holes** (NaN pixels enclosed by valid
-    data, across the union of bands) and **1 everywhere else** (valid
-    pixels and outside-footprint pixels). This single polarity works for
-    both gap-fill backends:
+    The mask is **0 only on fillable holes** and **1 everywhere else**
+    (valid pixels and outside-footprint pixels). This single polarity
+    works for both gap-fill backends:
 
       * v2 :func:`fill_nodata_file` reads ``mask != 0`` as the validity
         mask and only fills pixels where ``mask == 0`` (it preserves the
@@ -45,12 +75,30 @@ def write_interior_fill_mask(input_path: str, mask_path: str) -> None:
         convention: pixels with ``mask != 0`` are sources and never
         modified; pixels with ``mask == 0`` are the targets to fill.
 
-    The validity mask is built band-by-band with ``np.logical_or`` so the
-    full cube never lives in memory at once.
+    Parameters
+    ----------
+    input_path : str
+        Source raster. Validity is the union of finite pixels across
+        all bands (built band-by-band with ``np.logical_or`` so the
+        full cube never lives in memory at once).
+    mask_path : str
+        Destination single-band uint8 GeoTIFF.
+    max_gap_px : int, default 0
+        Controls morphological closing of the validity footprint to
+        bridge narrow gaps -- including those that touch the raster
+        edge or extend to a concavity, which a topological fill alone
+        cannot reach. ``0`` reproduces the strict legacy behaviour
+        (only topologically enclosed holes are filled, byte-for-byte).
+        ``N > 0`` performs ``N`` iterations of dilation followed by
+        ``N`` iterations of erosion (4-connected) on the validity mask
+        and unions the result with the topological fill, so gaps up to
+        roughly ``2N`` pixels wide are bridged.
 
-    ``rasterio`` is imported lazily so this module's top-level import
-    surface stays numpy-only (matches the historical promise in the
-    module docstring).
+    ``rasterio`` and ``scipy`` are imported lazily so this module's
+    top-level import surface stays numpy-only (matches the historical
+    promise in the module docstring). When ``scipy`` is unavailable a
+    pure-numpy 4-connected fallback is used for both the topological
+    flood-fill and the closing.
     """
     import rasterio  # lazy: keep top-level imports numpy-only
 
@@ -65,14 +113,12 @@ def write_interior_fill_mask(input_path: str, mask_path: str) -> None:
             "compress": "deflate",
         }
 
-    # Interior holes = invalid pixels NOT reachable from the image border.
-    # Prefer scipy's binary_fill_holes; fall back to a pure-numpy 4-connected
-    # flood-fill from the border (project does not currently depend on
-    # scipy -- verified by grep).
+    # ---- Topologically enclosed holes (always) ---------------------------
+    # ``filled`` = validity OR all enclosed holes.
     invalid = ~validity
     try:
         from scipy.ndimage import binary_fill_holes
-        holes = binary_fill_holes(validity) & invalid
+        filled = binary_fill_holes(validity)
     except ImportError:
         outside = np.zeros_like(invalid)
         outside[0, :] = invalid[0, :]
@@ -91,9 +137,24 @@ def write_interior_fill_mask(input_path: str, mask_path: str) -> None:
             new[:, 1:] |= outside[:, :-1]
             new[:, :-1] |= outside[:, 1:]
             outside = new & invalid
-        holes = invalid & ~outside
+        filled = ~outside  # validity ∪ enclosed holes
 
-    mask = (~holes).astype(np.uint8)
+    # ---- Optional morphological closing (bridges edge-touching gaps) -----
+    if max_gap_px > 0:
+        try:
+            from scipy.ndimage import binary_closing
+            closed = binary_closing(validity, iterations=int(max_gap_px))
+        except ImportError:
+            closed = validity.copy()
+            for _ in range(int(max_gap_px)):
+                closed = _dilate4(closed)
+            for _ in range(int(max_gap_px)):
+                closed = _erode4(closed)
+        fill_region = (filled | closed) & invalid
+    else:
+        fill_region = filled & invalid
+
+    mask = (~fill_region).astype(np.uint8)
     with rasterio.open(mask_path, "w", **profile) as dst:
         dst.write(mask, 1)
 

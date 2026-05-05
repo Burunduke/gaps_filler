@@ -138,6 +138,7 @@ def run_pipeline(
     reproject_to_first: bool = False,
     gap_fill_func: Optional[Callable[..., None]] = None,
     fill_only_interior: bool = True,
+    max_interior_gap_px: int = 0,
 ) -> dict:
     """Run filter -> mosaic -> fill_nodata. Return a summary dict.
 
@@ -215,7 +216,10 @@ def run_pipeline(
         # the swath stays untouched. Opt-out via ``fill_only_interior``.
         if fill_only_interior:
             fill_mask_path = output_path + ".fillmask.tif"
-            fill_nodata.write_interior_fill_mask(mosaic_path, fill_mask_path)
+            fill_nodata.write_interior_fill_mask(
+                mosaic_path, fill_mask_path,
+                max_gap_px=int(max_interior_gap_px),
+            )
             log_cb("Footprint mask written to {}".format(fill_mask_path))
 
         cb(0.70, "fill: dispatching gap-fill on {} band(s)".format(band_count))

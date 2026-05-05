@@ -41,6 +41,7 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
     OUTPUT = "OUTPUT"
     REPROJECT_TO_FIRST = "REPROJECT_TO_FIRST"
     FILL_ONLY_INTERIOR = "FILL_ONLY_INTERIOR"
+    MAX_INTERIOR_GAP_PX = "MAX_INTERIOR_GAP_PX"
 
     FRAME_FILTER_METHOD = "FRAME_FILTER_METHOD"
     MOSAIC_METHOD = "MOSAIC_METHOD"
@@ -202,6 +203,21 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        gap_param = QgsProcessingParameterNumber(
+            self.MAX_INTERIOR_GAP_PX,
+            self.tr("Max interior gap width to bridge (pixels, 0 = strict)"),
+            type=Integer,
+            defaultValue=50,
+            minValue=0,
+        )
+        gap_param.setHelp(self.tr(
+            "Bridge narrow gaps in the validity footprint up to ~2N pixels "
+            "wide, so slits and edge-touching holes are filled. 0 = strict "
+            "(only topologically enclosed holes are filled). Ignored when "
+            "'Fill only interior holes' is OFF or a user mask is supplied."
+        ))
+        self.addParameter(gap_param)
+
         self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT, self.tr("Filled mosaic")
@@ -249,6 +265,8 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             parameters, self.REPROJECT_TO_FIRST, context)
         fill_only_interior = self.parameterAsBoolean(
             parameters, self.FILL_ONLY_INTERIOR, context)
+        max_interior_gap_px = self.parameterAsInt(
+            parameters, self.MAX_INTERIOR_GAP_PX, context)
 
         # Validate inputs up-front so the user gets a clear error in
         # ~1 second on a CRS / pixel-size / band-count / dtype mismatch
@@ -315,6 +333,7 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
                 reproject_to_first=reproject_to_first,
                 gap_fill_func=gap_fill_func,
                 fill_only_interior=fill_only_interior,
+                max_interior_gap_px=int(max_interior_gap_px),
             )
             # Stages A and B still use their single implemented version
             # internally; touch the resolved callables so static analysers

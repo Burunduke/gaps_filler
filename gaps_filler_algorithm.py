@@ -32,6 +32,7 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
     OUTPUT = "OUTPUT"
     GAP_FILL_METHOD = "GAP_FILL_METHOD"
     FILL_ONLY_INTERIOR = "FILL_ONLY_INTERIOR"
+    MAX_INTERIOR_GAP_PX = "MAX_INTERIOR_GAP_PX"
 
     # ---- Algorithm metadata ------------------------------------------------
 
@@ -122,6 +123,20 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
             "precedence and this checkbox is ignored."
         ))
         self.addParameter(interior_param)
+        gap_param = QgsProcessingParameterNumber(
+            self.MAX_INTERIOR_GAP_PX,
+            self.tr("Max interior gap width to bridge (pixels, 0 = strict)"),
+            type=QgsProcessingParameterNumber.Integer,
+            defaultValue=50,
+            minValue=0,
+        )
+        gap_param.setHelp(self.tr(
+            "Bridge narrow gaps in the validity footprint up to ~2N pixels "
+            "wide, so slits and edge-touching holes are filled. 0 = strict "
+            "(only topologically enclosed holes are filled). Ignored when "
+            "'Fill only interior holes' is OFF or a user mask is supplied."
+        ))
+        self.addParameter(gap_param)
         self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT, self.tr("Filled")
@@ -145,6 +160,8 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
             parameters, self.OUTPUT, context)
         fill_only_interior = self.parameterAsBoolean(
             parameters, self.FILL_ONLY_INTERIOR, context)
+        max_interior_gap_px = self.parameterAsInt(
+            parameters, self.MAX_INTERIOR_GAP_PX, context)
 
         in_path = src_layer.source()
         user_mask_path = mask_lyr.source() if mask_lyr is not None else None
@@ -172,7 +189,10 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
             auto_mask_path = out_path + ".fillmask.tif"
             feedback.pushInfo(
                 "Building interior-hole mask at {}".format(auto_mask_path))
-            fill_nodata.write_interior_fill_mask(in_path, auto_mask_path)
+            fill_nodata.write_interior_fill_mask(
+                in_path, auto_mask_path,
+                max_gap_px=int(max_interior_gap_px),
+            )
             mask_path = auto_mask_path
         else:
             mask_path = None

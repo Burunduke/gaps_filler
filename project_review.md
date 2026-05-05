@@ -795,3 +795,39 @@ inputs the result is byte-identical to the previous code path. Only
   `frame_filter.filter_frames`. `python3 -m py_compile
   gaps_filler_algorithm.py fill_nodata.py pipeline.py
   hyperspectral_algorithm.py methods.py` exited 0.
+
+- **2026-05-05** — Bridge narrow / edge-touching gaps in the
+  footprint-aware fill mask via morphological closing.
+  [`fill_nodata.write_interior_fill_mask()`](fill_nodata.py:62) gains
+  a `max_gap_px: int = 0` kwarg. `0` reproduces the prior strict
+  topological behaviour byte-for-byte (only `binary_fill_holes` is
+  applied, then `& ~validity` -- same code path as before). `N > 0`
+  additionally runs `binary_closing(validity, iterations=N)` and
+  unions it into the fill region, so slits and edge-touching holes
+  up to ~`2N` pixels wide are bridged -- something a topological fill
+  alone cannot reach (it skips any hole that touches the raster
+  border). scipy is preferred (`binary_fill_holes`, `binary_closing`)
+  with a pure-numpy 4-connected fallback for both: `_dilate4` /
+  `_erode4` helpers run `N` dilations followed by `N` erosions, and
+  the existing border-flood-fill stays as the topological fallback.
+  Wiring: [`pipeline.run_pipeline()`](pipeline.py:129) gains
+  `max_interior_gap_px: int = 0` (default keeps non-QGIS programmatic
+  callers byte-equivalent) and forwards it as
+  `write_interior_fill_mask(..., max_gap_px=...)` only when
+  `fill_only_interior=True`. The two QGIS algorithms
+  ([`FillNoDataAlgorithm`](gaps_filler_algorithm.py:25) and
+  [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:35))
+  expose a new `MAX_INTERIOR_GAP_PX` integer parameter (min 0,
+  default 50) so users see the fix immediately; the help text notes
+  it is ignored when 'Fill only interior holes' is OFF or a
+  user-supplied mask is in play. Helper signatures unchanged for
+  `fill_nodata.fill_nodata_file`, `fill_nodata.fill_nodata_file_gdal`,
+  `mosaic.mosaic_frames`, `frame_filter.filter_frames` and the
+  registry callables. **Files modified:**
+  [`fill_nodata.py`](fill_nodata.py:1), [`pipeline.py`](pipeline.py:1),
+  [`gaps_filler_algorithm.py`](gaps_filler_algorithm.py:1),
+  [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py:1),
+  [`hyperspectral_plan.md`](hyperspectral_plan.md:1).
+  `python3 -m py_compile fill_nodata.py pipeline.py
+  gaps_filler_algorithm.py hyperspectral_algorithm.py methods.py`
+  exited 0.
