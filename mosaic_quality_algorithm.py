@@ -33,16 +33,24 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
     # np.percentile(..,95) for lower-is-better). Plus whole-cube SAM.
     OUT_MEAN_RMSE = "MEAN_RMSE"
     OUT_WORST_RMSE = "WORST_RMSE"
+    OUT_WORST_RMSE_BAND = "WORST_RMSE_BAND"
     OUT_P05_RMSE = "P05_RMSE"
+    OUT_P05_RMSE_BAND = "P05_RMSE_BAND"
     OUT_MEAN_MAE = "MEAN_MAE"
     OUT_WORST_MAE = "WORST_MAE"
+    OUT_WORST_MAE_BAND = "WORST_MAE_BAND"
     OUT_P05_MAE = "P05_MAE"
+    OUT_P05_MAE_BAND = "P05_MAE_BAND"
     OUT_MEAN_PSNR = "MEAN_PSNR"
     OUT_WORST_PSNR = "WORST_PSNR"
+    OUT_WORST_PSNR_BAND = "WORST_PSNR_BAND"
     OUT_P05_PSNR = "P05_PSNR"
+    OUT_P05_PSNR_BAND = "P05_PSNR_BAND"
     OUT_MEAN_SSIM = "MEAN_SSIM"
     OUT_WORST_SSIM = "WORST_SSIM"
+    OUT_WORST_SSIM_BAND = "WORST_SSIM_BAND"
     OUT_P05_SSIM = "P05_SSIM"
+    OUT_P05_SSIM_BAND = "P05_SSIM_BAND"
     OUT_SAM = "SAM"           # whole-cube SAM in radians (lower is better)
     OUT_SAM_DEG = "SAM_DEG"   # same metric in degrees
 
@@ -70,13 +78,17 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
         return self.tr(
             "Pixel-wise quality assessment of a mosaic against a reference "
             "orthophoto. Computes per-band RMSE, MAE, PSNR and SSIM "
-            "(scikit-image required) and three aggregates per metric:\n"
+            "(scikit-image required) and aggregates per metric:\n"
             "  - MEAN_<M>: average across bands;\n"
             "  - WORST_<M>: worst per-band value (max for RMSE/MAE,\n"
             "    min for PSNR/SSIM);\n"
+            "  - WORST_<M>_BAND: 1-based index of the band that hit\n"
+            "    WORST_<M> (first occurrence on ties → deterministic);\n"
             "  - P05_<M>: '5% of bands are at least this bad' — uses\n"
             "    np.percentile(..,5) for PSNR/SSIM and np.percentile(..,95)\n"
-            "    for RMSE/MAE so the polarity convention is consistent.\n\n"
+            "    for RMSE/MAE so the polarity convention is consistent;\n"
+            "  - P05_<M>_BAND: 1-based index of the band whose value is\n"
+            "    closest to P05_<M> (first occurrence on ties).\n\n"
             "Also computes whole-cube SAM (Spectral Angle Mapper, lower is "
             "better): mean over valid pixels of the angle between reference "
             "and mosaic spectra; reported in radians (SAM) and degrees "
@@ -104,35 +116,62 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
                 self.MOSAIC, self.tr("Built mosaic")
             )
         )
-        # Band-level metric aggregates: MEAN / WORST / P05.
+        # Band-level metric aggregates: MEAN / WORST / WORST_BAND / P05 /
+        # P05_BAND. The *_BAND outputs are 1-based band indices (ints);
+        # QgsProcessingOutputNumber accepts ints fine, and there is no
+        # dedicated integer-output class for processing algorithms.
         self.addOutput(QgsProcessingOutputNumber(
             self.OUT_MEAN_RMSE, self.tr("Mean RMSE")))
         self.addOutput(QgsProcessingOutputNumber(
             self.OUT_WORST_RMSE, self.tr("Worst RMSE (max — lower is better)")))
         self.addOutput(QgsProcessingOutputNumber(
+            self.OUT_WORST_RMSE_BAND,
+            self.tr("Worst RMSE band (1-based index)")))
+        self.addOutput(QgsProcessingOutputNumber(
             self.OUT_P05_RMSE,
             self.tr("P05 RMSE (95th pct: 5% of bands are at least this bad)")))
+        self.addOutput(QgsProcessingOutputNumber(
+            self.OUT_P05_RMSE_BAND,
+            self.tr("P05 RMSE band (1-based index, nearest to P05)")))
         self.addOutput(QgsProcessingOutputNumber(
             self.OUT_MEAN_MAE, self.tr("Mean MAE")))
         self.addOutput(QgsProcessingOutputNumber(
             self.OUT_WORST_MAE, self.tr("Worst MAE (max — lower is better)")))
         self.addOutput(QgsProcessingOutputNumber(
+            self.OUT_WORST_MAE_BAND,
+            self.tr("Worst MAE band (1-based index)")))
+        self.addOutput(QgsProcessingOutputNumber(
             self.OUT_P05_MAE,
             self.tr("P05 MAE (95th pct: 5% of bands are at least this bad)")))
+        self.addOutput(QgsProcessingOutputNumber(
+            self.OUT_P05_MAE_BAND,
+            self.tr("P05 MAE band (1-based index, nearest to P05)")))
         self.addOutput(QgsProcessingOutputNumber(
             self.OUT_MEAN_PSNR, self.tr("Mean PSNR")))
         self.addOutput(QgsProcessingOutputNumber(
             self.OUT_WORST_PSNR, self.tr("Worst PSNR (min — higher is better)")))
         self.addOutput(QgsProcessingOutputNumber(
+            self.OUT_WORST_PSNR_BAND,
+            self.tr("Worst PSNR band (1-based index)")))
+        self.addOutput(QgsProcessingOutputNumber(
             self.OUT_P05_PSNR,
             self.tr("P05 PSNR (5th pct: 5% of bands are at least this bad)")))
+        self.addOutput(QgsProcessingOutputNumber(
+            self.OUT_P05_PSNR_BAND,
+            self.tr("P05 PSNR band (1-based index, nearest to P05)")))
         self.addOutput(QgsProcessingOutputNumber(
             self.OUT_MEAN_SSIM, self.tr("Mean SSIM")))
         self.addOutput(QgsProcessingOutputNumber(
             self.OUT_WORST_SSIM, self.tr("Worst SSIM (min — higher is better)")))
         self.addOutput(QgsProcessingOutputNumber(
+            self.OUT_WORST_SSIM_BAND,
+            self.tr("Worst SSIM band (1-based index)")))
+        self.addOutput(QgsProcessingOutputNumber(
             self.OUT_P05_SSIM,
             self.tr("P05 SSIM (5th pct: 5% of bands are at least this bad)")))
+        self.addOutput(QgsProcessingOutputNumber(
+            self.OUT_P05_SSIM_BAND,
+            self.tr("P05 SSIM band (1-based index, nearest to P05)")))
         # Whole-cube SAM (lower is better).
         self.addOutput(QgsProcessingOutputNumber(
             self.OUT_SAM, self.tr("SAM, radians (lower is better)")))
@@ -182,16 +221,24 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
         return {
             self.OUT_MEAN_RMSE: float(summary["mean_rmse"]),
             self.OUT_WORST_RMSE: float(summary["worst_rmse"]),
+            self.OUT_WORST_RMSE_BAND: int(summary["worst_rmse_band"]),
             self.OUT_P05_RMSE: float(summary["p05_rmse"]),
+            self.OUT_P05_RMSE_BAND: int(summary["p05_rmse_band"]),
             self.OUT_MEAN_MAE: float(summary["mean_mae"]),
             self.OUT_WORST_MAE: float(summary["worst_mae"]),
+            self.OUT_WORST_MAE_BAND: int(summary["worst_mae_band"]),
             self.OUT_P05_MAE: float(summary["p05_mae"]),
+            self.OUT_P05_MAE_BAND: int(summary["p05_mae_band"]),
             self.OUT_MEAN_PSNR: float(summary["mean_psnr"]),
             self.OUT_WORST_PSNR: float(summary["worst_psnr"]),
+            self.OUT_WORST_PSNR_BAND: int(summary["worst_psnr_band"]),
             self.OUT_P05_PSNR: float(summary["p05_psnr"]),
+            self.OUT_P05_PSNR_BAND: int(summary["p05_psnr_band"]),
             self.OUT_MEAN_SSIM: float(summary["mean_ssim"]),
             self.OUT_WORST_SSIM: float(summary["worst_ssim"]),
+            self.OUT_WORST_SSIM_BAND: int(summary["worst_ssim_band"]),
             self.OUT_P05_SSIM: float(summary["p05_ssim"]),
+            self.OUT_P05_SSIM_BAND: int(summary["p05_ssim_band"]),
             self.OUT_SAM: float(summary["sam"]),
             self.OUT_SAM_DEG: float(summary["sam_deg"]),
         }

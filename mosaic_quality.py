@@ -163,8 +163,8 @@ _LOWER_IS_BETTER = {"rmse", "mae"}
 _SAM_EPS = 1e-12
 
 
-def _aggregate_band_metric(values, key):
-    """Return ``(mean, worst, p05)`` for a per-band metric.
+def _aggregate_band_metric(values, key, bands=None):
+    """Return ``(mean, worst, p05, worst_band, p05_band)`` for a metric.
 
     - ``WORST`` = max for lower-is-better metrics (RMSE, MAE), min for
       higher-is-better metrics (PSNR, SSIM).
@@ -174,22 +174,41 @@ def _aggregate_band_metric(values, key):
           small value);
         * lower-is-better  → ``np.percentile(values, 95)`` (near-worst
           large value).
+    - ``worst_band`` is the 1-based band index that produced WORST
+      (``np.argmax`` / ``np.argmin``; on ties numpy returns the first
+      occurrence, so the lowest-indexed tying band wins → deterministic).
+    - ``p05_band`` is the 1-based band index whose value is closest to
+      ``P05`` (``np.argmin(abs(values - p05))``; first occurrence on ties).
+
+    ``bands`` is the parallel list of 1-based band indices for
+    ``values``; if omitted we fall back to ``1..len(values)`` (which is
+    only correct when no bands were skipped).
 
     With all-equal inputs ``MEAN == WORST == P05`` exactly, by
     construction (numpy.percentile of a constant array returns that
     constant).
     """
     if not values:
-        return float("nan"), float("nan"), float("nan")
+        nan = float("nan")
+        return nan, nan, nan, 0, 0
     arr = np.asarray(values, dtype=np.float64)
+    if bands is None:
+        bands_arr = np.arange(1, len(values) + 1, dtype=int)
+    else:
+        bands_arr = np.asarray(bands, dtype=int)
     mean_v = float(arr.mean())
     if key in _LOWER_IS_BETTER:
         worst_v = float(arr.max())
+        worst_idx = int(np.argmax(arr))
         p05_v = float(np.percentile(arr, 95))
     else:
         worst_v = float(arr.min())
+        worst_idx = int(np.argmin(arr))
         p05_v = float(np.percentile(arr, 5))
-    return mean_v, worst_v, p05_v
+    p05_idx = int(np.argmin(np.abs(arr - p05_v)))
+    worst_band = int(bands_arr[worst_idx])
+    p05_band = int(bands_arr[p05_idx])
+    return mean_v, worst_v, p05_v, worst_band, p05_band
 
 
 # ---------------------------------------------------------------------------
@@ -355,12 +374,18 @@ def compare_rasters(reference_path, mosaic_path, feedback=None):
         "per_band": per_band,
         "skipped_bands": skipped,
     }
+    # Parallel list of 1-based band indices for the values above; this
+    # matters when some bands were skipped (so list-position != band #).
+    band_idxs = [m["band"] for m in per_band]
     for key in ("rmse", "mae", "psnr", "ssim"):
         vals = [m[key] for m in per_band]
-        mean_v, worst_v, p05_v = _aggregate_band_metric(vals, key)
+        mean_v, worst_v, p05_v, worst_b, p05_b = _aggregate_band_metric(
+            vals, key, bands=band_idxs)
         summary["mean_" + key] = mean_v
         summary["worst_" + key] = worst_v
         summary["p05_" + key] = p05_v
+        summary["worst_" + key + "_band"] = worst_b
+        summary["p05_" + key + "_band"] = p05_b
 
     # ----- Whole-cube SAM --------------------------------------------------
     # angle(p, q) = arccos( clip( dot(p, q) / (||p|| * ||q|| + eps),
@@ -418,7 +443,7 @@ def format_report(summary):
     # P05 means "5% of bands are at least this bad" regardless of polarity
     # (higher-is-better → 5th pct; lower-is-better → 95th pct).
     def _row(label, prefix):
-        return ("{lbl:>5} | {r:>10.4f} | {m:>10.4f} | {p:>10.4f} | "
+        return ("{lbl:>10} | {r:>10.4f} | {m:>10.4f} | {p:>10.4f} | "
                 "{s:>10.4f} |").format(
             lbl=label,
             r=summary[prefix + "_rmse"],
@@ -426,9 +451,23 @@ def format_report(summary):
             p=summary[prefix + "_psnr"],
             s=summary[prefix + "_ssim"])
 
+    def _band_row(label, prefix):
+        # Band-index rows: integer band numbers, formatted as right-aligned
+        # ints inside the same 10-wide columns the float rows use.
+        return ("{lbl:>10} | {r:>10d} | {m:>10d} | {p:>10d} | "
+                "{s:>10d} |").format(
+            lbl=label,
+            r=summary[prefix + "_rmse_band"],
+            m=summary[prefix + "_mae_band"],
+            p=summary[prefix + "_psnr_band"],
+            s=summary[prefix + "_ssim_band"])
+
+    # Order per metric: MEAN → WORST → WORST_<M>_BAND → P05 → P05_<M>_BAND.
     lines.append(_row("MEAN", "mean"))
     lines.append(_row("WORST", "worst"))
+    lines.append(_band_row("WORST_BAND", "worst"))
     lines.append(_row("P05", "p05"))
+    lines.append(_band_row("P05_BAND", "p05"))
 
     # SAM is a single whole-cube scalar (lower is better).
     lines.append(

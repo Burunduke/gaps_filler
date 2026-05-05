@@ -896,3 +896,41 @@ Legend: RMSE / MAE — lower is better; PSNR / SSIM — higher is better.
     [`pipeline.py`](pipeline.py:1), [`methods.py`](methods.py:1) and
     every other algorithm file are untouched.
     [`hyperspectral_plan.md`](hyperspectral_plan.md:1) is unchanged.
+
+### 2026-05-05 — Mosaic Quality: surface offending band indices
+
+- **Goal.** Make it obvious *which band* drove `WORST_<M>` and
+  `P05_<M>` without scanning the per-band table.
+- **Modified:** [`mosaic_quality.py`](mosaic_quality.py:1)
+  — `_aggregate_band_metric()` now also returns
+  `(worst_band, p05_band)` (1-based). `worst_band` is from
+  `np.argmax`/`np.argmin` over the per-band values; `p05_band` is from
+  `np.argmin(abs(values - p05))` (closest band to the P05 threshold).
+  The caller passes a parallel `bands=[m["band"] for m in per_band]`
+  list so skipped bands stay correctly mapped. `format_report()` row
+  order per metric is now `MEAN_<M>` → `WORST_<M>` →
+  `WORST_<M>_BAND` → `P05_<M>` → `P05_<M>_BAND`, then `SAM` /
+  `SAM_DEG` as before.
+- **Modified:** [`mosaic_quality_algorithm.py`](mosaic_quality_algorithm.py:1)
+  — exposed 8 new `QgsProcessingOutputNumber` outputs
+  (`WORST_{RMSE,MAE,PSNR,SSIM}_BAND` and `P05_{RMSE,MAE,PSNR,SSIM}_BAND`)
+  as 1-based ints; `shortHelpString()` documents them.
+- **Tie behaviour.** `np.argmax`/`np.argmin`/`np.argmin(abs(...))` all
+  return the first occurrence on ties, so when every band ties the
+  result is the lowest band index in `per_band` — deterministic (band
+  1 if no bands were skipped).
+- **Backwards-compat.** Existing numeric values of `MEAN_<M>`,
+  `WORST_<M>`, `P05_<M>`, `SAM`, `SAM_DEG` are unchanged — the same
+  `arr.mean() / arr.max() / arr.min() / np.percentile(...)` calls
+  produce them. Only the new `*_BAND` keys / outputs / rows were added.
+  No new dependencies. The per-band table is untouched.
+- **Verification.** `python3 -m py_compile mosaic_quality.py
+  mosaic_quality_algorithm.py` → exit 0.
+- **Constraints honoured.** Only [`mosaic_quality.py`](mosaic_quality.py:1)
+  and [`mosaic_quality_algorithm.py`](mosaic_quality_algorithm.py:1)
+  were touched. [`mosaic.py`](mosaic.py:1),
+  [`fill_nodata.py`](fill_nodata.py:1),
+  [`frame_filter.py`](frame_filter.py:1),
+  [`pipeline.py`](pipeline.py:1), [`methods.py`](methods.py:1) and
+  other algorithm files are untouched.
+  [`hyperspectral_plan.md`](hyperspectral_plan.md:1) is unchanged.
