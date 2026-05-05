@@ -452,16 +452,16 @@ commercial-grade tool. Ordered roughly by ROI.
 
 ### Performance
 
-- [ ] **Add gap-fill v3 ([`gdal.FillNodata`](https://gdal.org/api/python/osgeo.gdal.html#osgeo.gdal.FillNodata))**
+- [x] **Add gap-fill v3 ([`gdal.FillNodata`](https://gdal.org/api/python/osgeo.gdal.html#osgeo.gdal.FillNodata))**
   alongside v2 in Stage C. Single biggest speedup. Keep v2 (the Python
   version) as the default fallback when GDAL is unavailable or
-  misbehaves.
+  misbehaves. (done 2026-05-05)
   - [x] End-to-end pipeline now honours the gap-fill method dropdown
     (registry dispatch through [`run_pipeline()`](pipeline.py:128)) — done 2026-05-05
-- [ ] **Windowed band processing in Stage C.** Read & fill in tiles
+- [x] **Windowed band processing in Stage C.** Read & fill in tiles
   (e.g. 2048×2048 with `max_distance` overlap) instead of full-band
   arrays — current code holds an entire band in RAM (~hundreds of MB
-  per band on big flights).
+  per band on big flights). (done 2026-05-05)
 - [ ] **Parallelise per-band loop** in
   [`pipeline.run_pipeline()`](pipeline.py:89) with
   `concurrent.futures.ProcessPoolExecutor` (bands are independent).

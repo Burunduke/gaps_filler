@@ -139,6 +139,8 @@ def run_pipeline(
     gap_fill_func: Optional[Callable[..., None]] = None,
     fill_only_interior: bool = True,
     max_interior_gap_px: int = 0,
+    tile_size: int = 0,
+    n_workers: int = 1,
 ) -> dict:
     """Run filter -> mosaic -> fill_nodata. Return a summary dict.
 
@@ -236,6 +238,8 @@ def run_pipeline(
             max_search_dist=float(max_distance),
             smoothing_iterations=int(smoothing_iterations),
             feedback=_PipelineFeedback(cb, log_cb),
+            tile_size=int(tile_size),
+            n_workers=int(n_workers),
         )
         cb(1.0, "fill: done")
     finally:

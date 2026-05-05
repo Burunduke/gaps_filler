@@ -934,3 +934,174 @@ Legend: RMSE / MAE — lower is better; PSNR / SSIM — higher is better.
   [`pipeline.py`](pipeline.py:1), [`methods.py`](methods.py:1) and
   other algorithm files are untouched.
   [`hyperspectral_plan.md`](hyperspectral_plan.md:1) is unchanged.
+
+### 2026-05-05 — Run with worst-band diagnostics (`MAX_INTERIOR_GAP_PX=50`, all current improvements)
+
+| Metric | MEAN | WORST (band) | P05 (band) |
+|---|---|---|---|
+| RMSE | 0.003910660253532197 | 0.013559284618043038 (38) | 0.012115237730602016 (27) |
+| MAE  | 0.0005470915808632717 | 0.0017883461460990143 (38) | 0.0016464821544427116 (48) |
+| PSNR | 51.754405044769726 | 28.049728903659542 (202) | 33.33327192993308 (134) |
+| SSIM | 0.9956317627913356 | 0.9597805687499575 (138) | 0.9775634930766522 (199) |
+
+| Whole-cube | Value |
+|---|---|
+| SAM (rad) | 0.00024121789320524526 |
+| SAM_DEG   | 0.013820767223697971 |
+
+**Notes.**
+- Mean metrics are excellent (RMSE ~0.4%, PSNR 51.8 dB, SSIM 0.996, SAM 0.014°) — the cube is, on average, a near-perfect reconstruction.
+- Worst-band differs across metrics (38 / 202 / 138) → at least three distinct failure modes rather than one universally bad band.
+- Band 38 owns both `WORST_RMSE` and `WORST_MAE`: highest absolute error, likely a bright channel with steep gradients near gap edges where any interpolation slip translates into large pixel-space residuals.
+- Band 202 has `WORST_PSNR ≈ 28 dB` at only moderate RMSE → low-MAX band (dark / SWIR or H₂O absorption region, low SNR), so PSNR is dominated by the small dynamic range rather than reconstruction error.
+- Band 138 has `WORST_SSIM` at moderate pixel error → structural artefacts (likely visible mosaic seams / texture discontinuities) that pixel-wise metrics under-weight.
+
+- **2026-05-05** — Plan / pipeline housekeeping pass.
+  - **Plan ([`hyperspectral_plan.md`](hyperspectral_plan.md:455)).** Marked
+    Pipeline TO-DO item #7 (gap-fill v3 / `gdal.FillNodata` + registry
+    dispatch) as `[x]` done with a `(done 2026-05-05)` trailing tag.
+    Item #7 was fully delivered earlier (the v3 backend
+    [`fill_nodata.fill_nodata_file_gdal()`](fill_nodata.py:670) +
+    end-to-end registry dispatch via the `gap_fill_func` kwarg of
+    [`pipeline.run_pipeline()`](pipeline.py:129)); this pass only updates
+    the checkbox so the plan reflects reality.
+  - **Implemented Pipeline TO-DO item #8: windowed band processing in
+    Stage C.** The v2 backend
+    [`fill_nodata.fill_nodata_file()`](fill_nodata.py:507) used to load
+    every band into RAM via `in_band.ReadAsArray()` -- on a ~280-band
+    PIKA-L cube at typical mosaic size that is hundreds of MB per band.
+    Added a new optional kwarg `tile_size: int = 0` and a small private
+    helper [`_fill_band_windowed()`](fill_nodata.py:441) that, when
+    `tile_size > 0`, walks each band as square inner-core tiles of
+    `tile_size` pixels read with a halo of
+    `max_search_dist + smoothing_iterations` pixels around each tile.
+    The halo is sized so a NaN pixel right on a tile boundary still
+    sees the same set of valid neighbours it would have seen if the
+    whole band had been processed at once -- so the windowed result is
+    observationally identical to the legacy whole-band path for any
+    sensible tile size. Only the inner core (without the halo) is
+    written back, so reads overlap but writes do not. Per-tile feedback
+    is suppressed inside [`fill_nodata()`](fill_nodata.py:291) (would
+    spam the log) and progress is mapped into each band's slice of the
+    [0..100] bar so multi-band cubes still get a smoothly-advancing
+    progress indicator.
+  - **Default behaviour unchanged.** `tile_size=0` (the default) keeps
+    the legacy whole-band code path byte-for-byte: `ReadAsArray()` ->
+    [`fill_nodata()`](fill_nodata.py:291) -> `WriteArray()`, identical
+    to before this change. The only side-effect of the refactor on the
+    default path is that the `WriteArray` / `SetNoDataValue` calls now
+    happen via a shared `out_band` local, which is a pure rename.
+  - **Registry consistency.** The v3 backend
+    [`fill_nodata.fill_nodata_file_gdal()`](fill_nodata.py:670) accepts
+    the same `tile_size` kwarg for signature parity (so the gap-fill
+    registry in [`methods.py`](methods.py:1) can dispatch to either
+    version with one call site) but **ignores** it with a one-line log
+    note when non-zero -- `gdal.FillNodata` already streams in C with
+    its own block cache, so a Python-level tile loop would only add
+    overhead. The pure-Python v2 fallback inside the v3 wrapper picks
+    `tile_size` up again automatically because it ends up calling
+    [`fill_nodata.fill_nodata_file()`](fill_nodata.py:507) with the
+    same signature.
+  - **Wiring.** [`pipeline.run_pipeline()`](pipeline.py:129) gains an
+    optional `tile_size: int = 0` kwarg forwarded into the registry
+    callable. Both gap-fill-relevant QGIS algorithms --
+    [`FillNoDataAlgorithm`](gaps_filler_algorithm.py:25) and
+    [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:35) --
+    expose a new `TILE_SIZE` integer parameter (min 0, default 0) with
+    help text explaining when to enable it and noting that v3 ignores
+    the value. The Stage A
+    [`FrameFilterAlgorithm`](frame_filter_algorithm.py:24) and Stage B
+    [`MosaicAlgorithm`](mosaic_algorithm.py:20) wrappers do **not** get
+    a `TILE_SIZE` parameter -- they don't run gap fill, so it would be
+    dead UI (matches the prior pattern, e.g. `FILL_ONLY_INTERIOR` is
+    only on the gap-fill-relevant algorithms).
+  - **Files modified:** [`fill_nodata.py`](fill_nodata.py:1),
+    [`pipeline.py`](pipeline.py:1),
+    [`gaps_filler_algorithm.py`](gaps_filler_algorithm.py:1),
+    [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py:1),
+    [`hyperspectral_plan.md`](hyperspectral_plan.md:1) (item #7 ticked),
+    [`project_review.md`](project_review.md:1) (this entry). Helper
+    signatures are unchanged for `fill_nodata.fill_nodata` (array-level),
+    `frame_filter.filter_frames`, `mosaic.mosaic_frames`,
+    `mosaic.validate_inputs` and `fill_nodata.write_interior_fill_mask`.
+    The two file-level gap-fill callables both got the additive
+    `tile_size=0` kwarg so the registry dispatch is unchanged for
+    callers that don't pass it.
+  - **Verification.** `python3 -m py_compile fill_nodata.py pipeline.py
+    gaps_filler_algorithm.py hyperspectral_algorithm.py methods.py
+    mosaic.py frame_filter.py frame_filter_algorithm.py
+    mosaic_algorithm.py` -> exit 0.
+    `grep -rn "fill_nodata_file\|tile_size\|run_pipeline" --include="*.py" .`
+    confirmed every call site of the two file-level fill functions
+    forwards `tile_size` consistently and no positional-argument call
+    site relies on the previous arity. `_fill_band_windowed` halo math
+    hand-traced: at the band edge `max(0, r0 - halo)` clamps the read
+    window correctly, and the inner-core write-back slice
+    `filled[ir0:ir1, ic0:ic1]` has dimensions `(r1-r0, c1-c0)` by
+    construction.
+
+- **2026-05-05** — Plan / pipeline housekeeping pass.
+  - **Plan ([`hyperspectral_plan.md`](hyperspectral_plan.md:461)).**
+    Marked Pipeline TO-DO item #8 (Windowed band processing in Stage C)
+    as `[x]` done with a `(done 2026-05-05)` trailing tag; the work
+    itself shipped in the previous changelog entry, this pass only
+    updates the checkbox so the plan reflects reality.
+  - **Implemented Pipeline TO-DO item #9: parallelise the per-band
+    loop.** The per-band loop now lives in
+    [`fill_nodata.fill_nodata_file()`](fill_nodata.py:551) (since the
+    earlier registry-dispatch refactor moved Stage C out of
+    [`pipeline.run_pipeline()`](pipeline.py:129)), so the parallelism
+    is added there. New optional kwarg `n_workers: int = 1`. `1` (the
+    default) keeps the legacy in-process loop byte-for-byte. `> 1`
+    submits each band to a `concurrent.futures.ProcessPoolExecutor`
+    via a new top-level worker
+    [`fill_nodata._fill_band_worker()`](fill_nodata.py:507) that
+    re-opens the input raster in its fresh interpreter, reads its band
+    plus (if given) the mask, runs the array-level
+    [`fill_nodata.fill_nodata()`](fill_nodata.py:291), and returns
+    `(b, filled, nodata)` to the parent. The parent stays
+    single-threaded for GDAL writes and consumes results via
+    `as_completed`, so big cubes don't keep all filled bands in RAM.
+    One process per band — matches the plan's "Watch GDAL
+    thread-safety: keep one process per band" note.
+  - **Smallest coherent slice.** Parallelism is only applied to the
+    whole-band code path. Tiled mode (`tile_size > 0`) keeps its
+    sequential per-tile feedback / progress mapping; if a caller
+    supplies both `tile_size > 0` and `n_workers > 1`, the latter is
+    logged as ignored. v3
+    ([`fill_nodata.fill_nodata_file_gdal()`](fill_nodata.py:782))
+    accepts `n_workers` for signature parity with v2 but ignores it
+    (`gdal.FillNodata` is already a C routine); the v2 fallback inside
+    v3 reverts to the default `n_workers=1`.
+  - **Wiring.** [`pipeline.run_pipeline()`](pipeline.py:129) gains
+    `n_workers: int = 1` forwarded into the registry callable. Both
+    gap-fill-relevant QGIS algorithms —
+    [`FillNoDataAlgorithm`](gaps_filler_algorithm.py:25) and
+    [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:35)
+    — expose a new `N_WORKERS` integer parameter (min 1, default 1)
+    with help text noting it is ignored under tiled mode and by v3.
+    [`FrameFilterAlgorithm`](frame_filter_algorithm.py:24) and
+    [`MosaicAlgorithm`](mosaic_algorithm.py:20) get no `N_WORKERS`
+    parameter — they don't run gap fill, so it would be dead UI
+    (matches the prior pattern for `TILE_SIZE` / `FILL_ONLY_INTERIOR`).
+  - **Files modified:** [`fill_nodata.py`](fill_nodata.py:1),
+    [`pipeline.py`](pipeline.py:1),
+    [`gaps_filler_algorithm.py`](gaps_filler_algorithm.py:1),
+    [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py:1),
+    [`hyperspectral_plan.md`](hyperspectral_plan.md:1) (item #8
+    ticked), [`project_review.md`](project_review.md:1) (this entry).
+    Helper signatures unchanged for `fill_nodata.fill_nodata`
+    (array-level), `fill_nodata.write_interior_fill_mask`,
+    `frame_filter.filter_frames`, `mosaic.mosaic_frames`,
+    `mosaic.validate_inputs`. The two file-level gap-fill callables
+    both got the additive `n_workers=1` kwarg so the registry dispatch
+    is unchanged for callers that don't pass it.
+  - **Verification.** `python3 -m py_compile fill_nodata.py
+    pipeline.py gaps_filler_algorithm.py hyperspectral_algorithm.py
+    methods.py mosaic.py frame_filter.py frame_filter_algorithm.py
+    mosaic_algorithm.py` → exit 0.
+    `grep -n "n_workers\|fill_nodata_file\|run_pipeline" *.py`
+    confirmed every gap-fill call site forwards `n_workers`
+    consistently (registry funcs in [`methods.py`](methods.py:1) take
+    it through `**kwargs` style by name) and no positional-argument
+    call site relies on the previous arity.

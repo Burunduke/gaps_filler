@@ -42,6 +42,8 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
     REPROJECT_TO_FIRST = "REPROJECT_TO_FIRST"
     FILL_ONLY_INTERIOR = "FILL_ONLY_INTERIOR"
     MAX_INTERIOR_GAP_PX = "MAX_INTERIOR_GAP_PX"
+    TILE_SIZE = "TILE_SIZE"
+    N_WORKERS = "N_WORKERS"
 
     FRAME_FILTER_METHOD = "FRAME_FILTER_METHOD"
     MOSAIC_METHOD = "MOSAIC_METHOD"
@@ -218,6 +220,41 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
         ))
         self.addParameter(gap_param)
 
+        tile_param = QgsProcessingParameterNumber(
+            self.TILE_SIZE,
+            self.tr("Tile size in pixels (0 = whole-band, no tiling)"),
+            type=Integer,
+            defaultValue=0,
+            minValue=0,
+        )
+        tile_param.setHelp(self.tr(
+            "When > 0, Stage C processes each band in square tiles of "
+            "this size with a halo of (max distance + smoothing "
+            "iterations) pixels around each tile, instead of loading "
+            "whole bands into RAM. Use this for big hyperspectral cubes "
+            "where a single band is hundreds of MB. 0 keeps the legacy "
+            "whole-band behaviour. The v3 backend (gdal.FillNodata) "
+            "ignores this -- it streams in C already."
+        ))
+        self.addParameter(tile_param)
+
+        workers_param = QgsProcessingParameterNumber(
+            self.N_WORKERS,
+            self.tr("Worker processes for per-band fill (1 = sequential)"),
+            type=Integer,
+            defaultValue=1,
+            minValue=1,
+        )
+        workers_param.setHelp(self.tr(
+            "When > 1, Stage C dispatches the per-band fill to a "
+            "ProcessPoolExecutor with one process per band (bands are "
+            "independent). 1 (the default) keeps the legacy in-process "
+            "loop. Ignored when 'Tile size' > 0 (tiled mode runs "
+            "sequentially) and by the v3 backend (gdal.FillNodata is "
+            "already a C routine)."
+        ))
+        self.addParameter(workers_param)
+
         self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT, self.tr("Filled mosaic")
@@ -267,6 +304,10 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             parameters, self.FILL_ONLY_INTERIOR, context)
         max_interior_gap_px = self.parameterAsInt(
             parameters, self.MAX_INTERIOR_GAP_PX, context)
+        tile_size = self.parameterAsInt(
+            parameters, self.TILE_SIZE, context)
+        n_workers = self.parameterAsInt(
+            parameters, self.N_WORKERS, context)
 
         # Validate inputs up-front so the user gets a clear error in
         # ~1 second on a CRS / pixel-size / band-count / dtype mismatch
@@ -334,6 +375,8 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
                 gap_fill_func=gap_fill_func,
                 fill_only_interior=fill_only_interior,
                 max_interior_gap_px=int(max_interior_gap_px),
+                tile_size=int(tile_size),
+                n_workers=int(n_workers),
             )
             # Stages A and B still use their single implemented version
             # internally; touch the resolved callables so static analysers

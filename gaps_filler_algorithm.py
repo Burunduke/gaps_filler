@@ -33,6 +33,8 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
     GAP_FILL_METHOD = "GAP_FILL_METHOD"
     FILL_ONLY_INTERIOR = "FILL_ONLY_INTERIOR"
     MAX_INTERIOR_GAP_PX = "MAX_INTERIOR_GAP_PX"
+    TILE_SIZE = "TILE_SIZE"
+    N_WORKERS = "N_WORKERS"
 
     # ---- Algorithm metadata ------------------------------------------------
 
@@ -137,6 +139,39 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
             "'Fill only interior holes' is OFF or a user mask is supplied."
         ))
         self.addParameter(gap_param)
+        tile_param = QgsProcessingParameterNumber(
+            self.TILE_SIZE,
+            self.tr("Tile size in pixels (0 = whole-band, no tiling)"),
+            type=QgsProcessingParameterNumber.Integer,
+            defaultValue=0,
+            minValue=0,
+        )
+        tile_param.setHelp(self.tr(
+            "When > 0, each band is processed in square tiles of this "
+            "size with a halo of (max distance + smoothing iterations) "
+            "pixels around each tile, instead of loading whole bands "
+            "into RAM. Use this for big hyperspectral cubes where a "
+            "single band is hundreds of MB. 0 keeps the legacy "
+            "whole-band behaviour. The v3 backend (gdal.FillNodata) "
+            "ignores this -- it streams in C already."
+        ))
+        self.addParameter(tile_param)
+        workers_param = QgsProcessingParameterNumber(
+            self.N_WORKERS,
+            self.tr("Worker processes for per-band fill (1 = sequential)"),
+            type=QgsProcessingParameterNumber.Integer,
+            defaultValue=1,
+            minValue=1,
+        )
+        workers_param.setHelp(self.tr(
+            "When > 1, the per-band fill loop is dispatched to a "
+            "ProcessPoolExecutor with one process per band (bands are "
+            "independent). 1 (the default) keeps the legacy in-process "
+            "loop. Ignored when 'Tile size' > 0 (tiled mode runs "
+            "sequentially) and by the v3 backend (gdal.FillNodata is "
+            "already a C routine)."
+        ))
+        self.addParameter(workers_param)
         self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT, self.tr("Filled")
@@ -162,6 +197,10 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
             parameters, self.FILL_ONLY_INTERIOR, context)
         max_interior_gap_px = self.parameterAsInt(
             parameters, self.MAX_INTERIOR_GAP_PX, context)
+        tile_size = self.parameterAsInt(
+            parameters, self.TILE_SIZE, context)
+        n_workers = self.parameterAsInt(
+            parameters, self.N_WORKERS, context)
 
         in_path = src_layer.source()
         user_mask_path = mask_lyr.source() if mask_lyr is not None else None
@@ -205,6 +244,8 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
                 max_search_dist=float(distance),
                 smoothing_iterations=int(iters),
                 feedback=feedback,
+                tile_size=int(tile_size),
+                n_workers=int(n_workers),
             )
         except RuntimeError as exc:
             # fill_nodata raises RuntimeError("canceled") when feedback

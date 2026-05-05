@@ -437,9 +437,121 @@ def fill_nodata(band,
     return out
 
 
+def _fill_band_windowed(in_band, out_band, ext_mask_arr,
+                        max_search_dist, smoothing_iterations,
+                        nodata, tile_size, feedback, b, band_count):
+    """Fill one band tile-by-tile so the whole band never lives in RAM.
+
+    Each tile is read with a halo of ``max_search_dist + smoothing_iterations``
+    pixels around its inner core. :func:`fill_nodata` runs on the tile
+    plus halo, and only the inner core (without the halo) is written
+    back to the output band. The halo guarantees that a NaN pixel right
+    on a tile boundary still sees the same set of valid neighbours it
+    would have seen if the whole band had been processed at once, so
+    the windowed result is observationally identical to the whole-band
+    path for any tile size large enough to contain the search radius.
+
+    ``tile_size`` is the size of the inner core (output) tile in pixels;
+    the read window is always ``tile_size + 2 * halo`` wide / tall
+    (clipped to band bounds at the edges).
+    """
+    H = in_band.YSize
+    W = in_band.XSize
+    halo = int(max_search_dist) + int(smoothing_iterations)
+    n_tiles_y = (H + tile_size - 1) // tile_size
+    n_tiles_x = (W + tile_size - 1) // tile_size
+    n_tiles = max(1, n_tiles_y * n_tiles_x)
+    done = 0
+    for ti in range(n_tiles_y):
+        for tj in range(n_tiles_x):
+            if feedback is not None and feedback.isCanceled():
+                raise RuntimeError("canceled")
+            # Inner core (the region we'll actually write back).
+            r0 = ti * tile_size
+            c0 = tj * tile_size
+            r1 = min(r0 + tile_size, H)
+            c1 = min(c0 + tile_size, W)
+            # Read window (inner core + halo, clipped at band edges).
+            rr0 = max(0, r0 - halo)
+            cc0 = max(0, c0 - halo)
+            rr1 = min(H, r1 + halo)
+            cc1 = min(W, c1 + halo)
+            arr = in_band.ReadAsArray(cc0, rr0, cc1 - cc0, rr1 - rr0)
+            if ext_mask_arr is not None:
+                mtile = ext_mask_arr[rr0:rr1, cc0:cc1]
+            else:
+                mtile = None
+            filled = fill_nodata(
+                arr,
+                mask=mtile,
+                max_search_dist=max_search_dist,
+                smoothing_iterations=smoothing_iterations,
+                nodata=nodata,
+                feedback=None,  # per-tile feedback would spam the log
+            )
+            # Crop the halo off and write the inner core.
+            ir0 = r0 - rr0
+            ic0 = c0 - cc0
+            ir1 = ir0 + (r1 - r0)
+            ic1 = ic0 + (c1 - c0)
+            out_band.WriteArray(filled[ir0:ir1, ic0:ic1], c0, r0)
+            done += 1
+            if feedback is not None:
+                # Map this band's tile progress into the band's slice of
+                # the [0..100] progress bar so multi-band cubes still get
+                # a smoothly-advancing bar.
+                band_frac = ((b - 1) + done / n_tiles) / band_count
+                feedback.setProgress(int(100 * band_frac))
+
+
+def _fill_band_worker(input_path, b, mask_path,
+                      max_search_dist, smoothing_iterations):
+    """Top-level worker (one band per call) for :class:`ProcessPoolExecutor`.
+
+    Each worker process re-opens the input raster, reads its assigned
+    band plus (if given) the validity mask, runs the array-level
+    :func:`fill_nodata`, and returns ``(b, filled, nodata)``. Re-opening
+    per call keeps every worker independent -- one process per band, no
+    shared GDAL state across processes -- as required by Pipeline TO-DO
+    item #9 in ``hyperspectral_plan.md`` ("Watch GDAL thread-safety:
+    keep one process per band.").
+
+    The function is at module top level so :mod:`pickle` (used by
+    :class:`ProcessPoolExecutor`) can serialise it.
+    """
+    from osgeo import gdal  # local import: workers spawn fresh interpreters
+    src = gdal.Open(input_path, gdal.GA_ReadOnly)
+    if src is None:
+        raise IOError("Cannot open {}".format(input_path))
+    in_band = src.GetRasterBand(b)
+    nodata = in_band.GetNoDataValue()
+    arr = in_band.ReadAsArray()
+    src = None
+
+    mask = None
+    if mask_path:
+        msrc = gdal.Open(mask_path, gdal.GA_ReadOnly)
+        if msrc is None:
+            raise IOError("Cannot open mask {}".format(mask_path))
+        marr = msrc.GetRasterBand(1).ReadAsArray()
+        msrc = None
+        mask = marr != 0
+
+    filled = fill_nodata(
+        arr,
+        mask=mask,
+        max_search_dist=max_search_dist,
+        smoothing_iterations=smoothing_iterations,
+        nodata=nodata,
+        feedback=None,  # per-worker feedback would garble the parent log
+    )
+    return b, filled, nodata
+
+
 def fill_nodata_file(input_path, output_path,
                      mask_path=None, max_search_dist=10.0,
-                     smoothing_iterations=0, feedback=None):
+                     smoothing_iterations=0, feedback=None,
+                     tile_size=0, n_workers=1):
     """Fill nodata in **every** band of a raster and write a multi-band GeoTIFF.
 
     All bands of the input are processed with the same parameters; each
@@ -456,6 +568,28 @@ def fill_nodata_file(input_path, output_path,
     A duck-typed :class:`QgsProcessingFeedback` may be passed via
     ``feedback``; it will receive ``pushInfo`` messages and ``setProgress``
     updates and is polled for ``isCanceled()``.
+
+    Parameters
+    ----------
+    tile_size : int, default 0
+        When ``> 0``, each band is processed in square tiles of
+        ``tile_size`` pixels (read with a halo of
+        ``max_search_dist + smoothing_iterations`` pixels around each
+        tile so border pixels see the same neighbours they would have
+        seen in the whole-band path). This keeps memory bounded to a
+        few tiles instead of an entire band, which can be hundreds of
+        MB per band on big hyperspectral cubes (Pipeline TO-DO item #8
+        in ``hyperspectral_plan.md``). ``0`` (the default) reproduces
+        the legacy whole-band behaviour byte-for-byte.
+    n_workers : int, default 1
+        Number of worker processes for the per-band fill (Pipeline
+        TO-DO item #9 in ``hyperspectral_plan.md``). ``1`` (the default)
+        runs the legacy in-process loop byte-for-byte. ``> 1`` dispatches
+        bands to a :class:`concurrent.futures.ProcessPoolExecutor` --
+        bands are independent, and one process per band keeps GDAL
+        thread-safe (each worker re-opens the input). Ignored when
+        ``tile_size > 0`` (the per-tile feedback / progress mapping
+        depends on a single-process iteration order; logged as a no-op).
     """
     from osgeo import gdal  # local import: keep plugin import-time light
 
@@ -525,30 +659,107 @@ def fill_nodata_file(input_path, output_path,
                 band_count, src.RasterXSize, src.RasterYSize))
         feedback.setProgress(0)
 
-    # Per-band fill loop. Each band gets its own nodata sentinel.
-    for b in range(1, band_count + 1):
-        in_band = src.GetRasterBand(b)
-        arr = in_band.ReadAsArray()
-        nodata = in_band.GetNoDataValue()
+    use_tiles = int(tile_size) > 0
+    if feedback is not None and use_tiles:
+        feedback.pushInfo(
+            "Windowed mode: tile_size={} px, halo={} px".format(
+                int(tile_size),
+                int(max_search_dist) + int(smoothing_iterations)))
 
-        if feedback is not None:
+    # Pipeline TO-DO item #9: parallelise the per-band loop with
+    # :class:`concurrent.futures.ProcessPoolExecutor` when the caller
+    # asks for it. One process per band keeps GDAL thread-safe (each
+    # worker re-opens the input in its own interpreter). The whole-band
+    # path is the only one that parallelises -- the tiled path's
+    # per-tile feedback / progress mapping is built around a single
+    # in-process iteration, so we keep it sequential and just log a
+    # one-line note when ``n_workers > 1`` is supplied alongside tiles.
+    use_workers = int(n_workers) > 1 and not use_tiles
+    if feedback is not None:
+        if use_workers:
             feedback.pushInfo(
-                "Band {}/{} (nodata={})".format(b, band_count, nodata))
+                "Parallel fill: {} worker process(es)".format(int(n_workers)))
+        elif int(n_workers) > 1 and use_tiles:
+            feedback.pushInfo(
+                "Note: n_workers={} ignored when tile_size > 0; "
+                "tiled mode runs sequentially.".format(int(n_workers)))
 
-        filled = fill_nodata(
-            arr,
-            mask=mask,
-            max_search_dist=max_search_dist,
-            smoothing_iterations=smoothing_iterations,
-            nodata=nodata,
-            feedback=feedback,
-        )
-        dst.GetRasterBand(b).WriteArray(filled)
-        if nodata is not None:
-            dst.GetRasterBand(b).SetNoDataValue(nodata)
+    if use_workers:
+        # Parent stays single-threaded for GDAL writes; workers only
+        # read and run the array-level fill. Submit every band, then
+        # write results as they come back so big cubes don't keep all
+        # filled arrays in RAM at once.
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        # Close the source dataset so workers see a clean file handle
+        # on Windows (and so we don't hold an extra fd open for nothing).
+        src = None
+        bands_done = 0
+        with ProcessPoolExecutor(max_workers=int(n_workers)) as pool:
+            futures = {
+                pool.submit(_fill_band_worker,
+                            input_path, b, mask_path,
+                            max_search_dist, smoothing_iterations): b
+                for b in range(1, band_count + 1)
+            }
+            try:
+                for fut in as_completed(futures):
+                    if feedback is not None and feedback.isCanceled():
+                        # Best-effort: drop pending work and raise.
+                        for f in futures:
+                            f.cancel()
+                        raise RuntimeError("canceled")
+                    b, filled, nodata = fut.result()
+                    out_band = dst.GetRasterBand(b)
+                    out_band.WriteArray(filled)
+                    if nodata is not None:
+                        out_band.SetNoDataValue(nodata)
+                    bands_done += 1
+                    if feedback is not None:
+                        feedback.pushInfo(
+                            "Band {}/{} done (nodata={})".format(
+                                b, band_count, nodata))
+                        feedback.setProgress(
+                            int(100 * bands_done / band_count))
+            except Exception:
+                # Re-raise after letting the executor's context manager
+                # tear down workers (the ``with`` block above handles it).
+                raise
+    else:
+        # Per-band fill loop. Each band gets its own nodata sentinel.
+        for b in range(1, band_count + 1):
+            in_band = src.GetRasterBand(b)
+            out_band = dst.GetRasterBand(b)
+            nodata = in_band.GetNoDataValue()
 
-        if feedback is not None:
-            feedback.setProgress(int(100 * b / band_count))
+            if feedback is not None:
+                feedback.pushInfo(
+                    "Band {}/{} (nodata={})".format(b, band_count, nodata))
+
+            if use_tiles:
+                # Tile loop -- bounded RAM (a few tiles at a time, not the
+                # whole band). Observationally identical to the whole-band
+                # path for any tile_size >= 1 because each tile is read with
+                # a halo of ``max_search_dist + smoothing_iterations`` pixels.
+                _fill_band_windowed(
+                    in_band, out_band, mask,
+                    max_search_dist, smoothing_iterations,
+                    nodata, int(tile_size), feedback, b, band_count)
+            else:
+                arr = in_band.ReadAsArray()
+                filled = fill_nodata(
+                    arr,
+                    mask=mask,
+                    max_search_dist=max_search_dist,
+                    smoothing_iterations=smoothing_iterations,
+                    nodata=nodata,
+                    feedback=feedback,
+                )
+                out_band.WriteArray(filled)
+                if feedback is not None:
+                    feedback.setProgress(int(100 * b / band_count))
+
+            if nodata is not None:
+                out_band.SetNoDataValue(nodata)
 
     dst.FlushCache()
     written_bands = dst.RasterCount
@@ -570,8 +781,17 @@ def fill_nodata_file(input_path, output_path,
 
 def fill_nodata_file_gdal(input_path, output_path,
                           mask_path=None, max_search_dist=10.0,
-                          smoothing_iterations=0, feedback=None):
+                          smoothing_iterations=0, feedback=None,
+                          tile_size=0, n_workers=1):
     """Fill nodata using native :func:`osgeo.gdal.FillNodata` (C-speed).
+
+    The ``tile_size`` kwarg is accepted for signature consistency with
+    :func:`fill_nodata_file` (so the gap-fill registry can dispatch to
+    either backend with the same call site) but is **ignored** here:
+    :func:`osgeo.gdal.FillNodata` already streams in C with its own
+    block cache, so the Python-level windowing that v2 needs to bound
+    its RAM footprint is not applicable. A non-zero value is logged
+    and forwarded as a no-op.
 
     Drop-in v3 alternative to :func:`fill_nodata_file` (Pipeline TO-DO
     item #7 in ``hyperspectral_plan.md``). Same signature so the gap-fill
@@ -592,9 +812,27 @@ def fill_nodata_file_gdal(input_path, output_path,
     to :func:`fill_nodata_file` (the pure-Python v2 path) so the
     algorithm still produces an output. Cancellation via ``feedback``
     is honoured between bands.
+
+    The ``n_workers`` kwarg is accepted for signature parity with
+    :func:`fill_nodata_file` (Pipeline TO-DO item #9 in
+    ``hyperspectral_plan.md``) but is **ignored** here -- per-band
+    parallelism only helps the pure-Python v2 path; ``gdal.FillNodata``
+    is already a C routine and would not benefit from a Python-level
+    process pool. If the v2 fallback below kicks in, ``n_workers`` is
+    forwarded so the user's choice still applies.
     """
     from osgeo import gdal  # local import: keep plugin import-time light
 
+    if feedback is not None and int(tile_size) > 0:
+        feedback.pushInfo(
+            "Note: tile_size={} is ignored by v3 (gdal.FillNodata streams "
+            "in C); see fill_nodata_file_gdal docstring."
+            .format(int(tile_size)))
+    if feedback is not None and int(n_workers) > 1:
+        feedback.pushInfo(
+            "Note: n_workers={} is ignored by v3 (gdal.FillNodata is a "
+            "C routine); only the v2 fallback would honour it."
+            .format(int(n_workers)))
     if feedback is not None:
         feedback.pushInfo("Opening input: {}".format(input_path))
     src = gdal.Open(input_path, gdal.GA_ReadOnly)
