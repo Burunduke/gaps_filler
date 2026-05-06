@@ -5,9 +5,9 @@ Exposes Stage B of the hyperspectral pipeline (mosaic of already-filtered
 frames) as a standalone QGIS Processing algorithm. The actual blending
 strategy for overlapping pixels is picked from the ``Mosaic method``
 dropdown (registered in :data:`methods.MOSAIC_METHODS` — currently
-``v1`` first-write-wins, ``v4`` feather, ``v5`` histmatch + feather);
-the algorithm's display name keeps the original ``first-write-wins``
-wording for backwards compatibility with saved Model Builder graphs.
+``v1`` first-write-wins, ``v4`` feather, ``v5`` histmatch + feather).
+The internal algorithm id (``name()`` -> ``"mosaic_frames"``) is kept
+unchanged so saved Model Builder graphs keep resolving this algorithm.
 """
 
 import os
@@ -49,7 +49,7 @@ def _is_empty_output(raw):
 
 
 class MosaicAlgorithm(QgsProcessingAlgorithm):
-    """Mosaic frames with first-write-wins overlap into a single GeoTIFF."""
+    """Mosaic frames into a single GeoTIFF; overlap rule is method-dependent."""
 
     INPUT_LAYERS = "INPUT_LAYERS"
     OUTPUT = "OUTPUT"
@@ -69,7 +69,7 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
         return "mosaic_frames"
 
     def displayName(self):
-        return self.tr("Mosaic frames (first-write-wins)")
+        return self.tr("Mosaic frames")
 
     def group(self):
         return self.tr("Raster analysis")
@@ -79,9 +79,12 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
 
     def shortHelpString(self):
         return self.tr(
-            "Mosaics the supplied frames into a single GeoTIFF using "
-            "first-write-wins for overlapping pixels. All inputs must "
-            "share CRS and pixel size."
+            "Mosaics the supplied frames into a single GeoTIFF. The "
+            "blending rule for overlapping pixels is picked from the "
+            "'Mosaic method' dropdown (v1 — first-write-wins; v4 — "
+            "feathered / weighted blending; v5 — histogram match + "
+            "feather, visual-only). All inputs must share CRS and "
+            "pixel size (or enable reprojection below)."
         )
 
     # ---- Parameters --------------------------------------------------------

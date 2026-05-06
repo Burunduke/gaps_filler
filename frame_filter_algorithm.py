@@ -94,9 +94,12 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
 
     def shortHelpString(self):
         return self.tr(
-            "Runs the PIKA-L bad-frame heuristic over the supplied rasters "
-            "and copies the survivors into the chosen output folder; the "
-            "rejection report lists why each frame was dropped."
+            "Rejects obviously-bad PIKA-L frames and copies the survivors "
+            "into the chosen output folder; the rejection report lists "
+            "why each frame was dropped. The actual rejection rule is "
+            "picked from the 'Filter method' dropdown (v1 — hard "
+            "thresholds; v2 — adaptive MAD per flight; v3 — per-band "
+            "striping / dropout detection)."
         )
 
     # ---- Parameters --------------------------------------------------------
