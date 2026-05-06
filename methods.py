@@ -81,52 +81,22 @@ FRAME_FILTER_METHODS = [
 # Stage B — Mosaic building
 # ---------------------------------------------------------------------------
 
+# Only the spectrally-faithful v1 path is registered. The visual-only
+# v4 (feather) and v5 (histmatch + feather) variants used to live here
+# but were removed because they alter / blur per-pixel spectra and the
+# project prioritises data correctness over visual appearance.
 MOSAIC_METHODS = [
     {
         "id": "v1_first_write_wins",
         "label": "v1 — First-write-wins (default)",
         "tooltip": (
-            "Default for production. Spectrally faithful — every output "
-            "pixel comes from exactly one source frame, no mixing. "
-            "Use when downstream analysis is spectral (classifiers, "
-            "indices). "
-            "Limit: visible seams; if seams are unacceptable, try v3 "
-            "(best placement) or v4 (feathered)."
+            "Spectrally faithful — every output pixel comes from "
+            "exactly one source frame, no mixing. Suitable for "
+            "downstream spectral analysis (classifiers, indices). "
+            "Limit: visible seams in overlap regions are accepted as "
+            "the cost of exact-data preservation."
         ),
         "func": mosaic.mosaic_frames,
-    },
-    {
-        "id": "v4_feather",
-        "label": "v4 — Feathered / weighted blending",
-        "tooltip": (
-            "Use for commercial-grade visual deliverables — overlapping "
-            "frames are blended by distance-to-frame-edge so seams "
-            "disappear. The 'Max feather pixels' parameter controls the "
-            "ramp width (default 32). "
-            "Limit: spectra blur in overlap zones — not for strict "
-            "spectral analysis. Keep v1 selectable for the scientific "
-            "export path."
-        ),
-        "func": mosaic.mosaic_frames_feather,
-    },
-    {
-        "id": "v5_histmatch_feather",
-        "label": "v5 — Histogram match + feather (visual; alters spectra)",
-        "tooltip": (
-            "Visual-only refinement of v4. Before feathering, each "
-            "non-reference frame's bands are linearly rescaled "
-            "(mean/std moment matching) toward the reference frame so "
-            "brightness/contrast jumps between strips disappear; the "
-            "v4 feather blend then hides the residual seams. "
-            "Reference frame = the first input. The 'Max feather "
-            "pixels' parameter is shared with v4. "
-            "Warning: alters per-pixel spectral values. Use only when "
-            "visual continuity matters more than spectral accuracy — "
-            "do NOT use for classifiers, indices, or any downstream "
-            "spectral analysis. Keep v1 for the scientific export "
-            "path."
-        ),
-        "func": mosaic.mosaic_frames_histmatch_feather,
     },
 ]
 

@@ -178,7 +178,6 @@ def run_pipeline(
     max_dropout_frac: float = frame_filter.MAX_DROPOUT_FRAC,
     max_stripe_ratio: float = frame_filter.MAX_STRIPE_RATIO,
     mosaic_func: Optional[Callable[..., str]] = None,
-    max_feather_pixels: int = 32,
     gap_fill_func: Optional[Callable[..., None]] = None,
     fill_only_interior: bool = True,
     max_interior_gap_px: int = 0,
@@ -220,8 +219,7 @@ def run_pipeline(
     # we now bridge via ``_PipelineFeedback`` below.
     # Only v2 (filter_frames_adaptive_mad) accepts ``k_mad``; v1 keeps
     # its original signature, so we add the kwarg selectively to keep
-    # older methods byte-equivalent. Same pattern as ``max_feather_pixels``
-    # for mosaic v4.
+    # older methods byte-equivalent.
     filter_kwargs = {"thresholds": thresholds, "is_canceled": is_canceled}
     if filter_func is frame_filter.filter_frames_adaptive_mad:
         filter_kwargs["k_mad"] = float(k_mad)
@@ -268,20 +266,14 @@ def run_pipeline(
     band_count = 0
     fill_mask_path: Optional[str] = None
     try:
-        # Only v4 (mosaic_frames_feather) and v5
-        # (mosaic_frames_histmatch_feather) accept ``max_feather_pixels``;
-        # v1 retains its original signature, so we add the kwarg
-        # selectively to keep older methods byte-equivalent.
-        mosaic_kwargs = {
-            "progress": lambda f, m: cb(0.05 + 0.65 * f, "mosaic: " + m),
-            "reproject_to_first": reproject_to_first,
-        }
-        if mosaic_func in (
-            mosaic.mosaic_frames_feather,
-            mosaic.mosaic_frames_histmatch_feather,
-        ):
-            mosaic_kwargs["max_feather_pixels"] = int(max_feather_pixels)
-        mosaic_func(good, mosaic_path, **mosaic_kwargs)
+        # Only v1 first-write-wins is registered; visual-only feather
+        # variants were removed to keep the mosaic spectrally exact.
+        mosaic_func(
+            good,
+            mosaic_path,
+            progress=lambda f, m: cb(0.05 + 0.65 * f, "mosaic: " + m),
+            reproject_to_first=reproject_to_first,
+        )
         # All-NaN-band guard (Pipeline TO-DO item #4): scan the Stage-B
         # mosaic on disk before invoking the file-level gap-fill callable.
         # Either gap-fill backend (v2 pure-Python or v3 gdal.FillNodata)

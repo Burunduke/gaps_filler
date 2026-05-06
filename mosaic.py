@@ -3,18 +3,18 @@
 
 Mosaic a list of already-filtered, georeferenced PIKA-L GeoTIFF frames
 into a single tiled BigTIFF, processed band-by-band to keep memory
-bounded. Output is ``float32`` with ``NaN`` as NoData. The strategy
-used for overlapping pixels is **method-dependent**: the active
+bounded. Output is ``float32`` with ``NaN`` as NoData. The active
 mosaic method is selected at the call site via
-:data:`methods.MOSAIC_METHODS` (e.g. ``v1`` first-write-wins,
-``v4`` distance-weighted feather, ``v5`` histogram match + feather).
+:data:`methods.MOSAIC_METHODS`; only the spectrally-faithful ``v1``
+first-write-wins path is registered. The visual-only feather and
+histmatch+feather variants below are kept as unregistered helpers
+(no longer reachable from QGIS) so the project keeps a single
+exact-data mosaic path.
 
-Public API (one entry per registered method, plus shared helpers):
+Public API:
     * :class:`MosaicInputError` — raised on incompatible inputs.
     * :func:`validate_inputs` — cross-frame compatibility check.
     * :func:`mosaic_frames` — v1 first-write-wins band-streaming writer.
-    * :func:`mosaic_frames_feather` — v4 feathered / weighted blend.
-    * :func:`mosaic_frames_histmatch_feather` — v5 histmatch + feather.
 
 Dependencies are limited to ``rasterio``, ``numpy`` and the Python
 stdlib; in particular this module must not import ``osgeo.gdal`` or

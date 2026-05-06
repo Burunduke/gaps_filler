@@ -70,7 +70,6 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
     MAX_INTERIOR_GAP_PX = "MAX_INTERIOR_GAP_PX"
     TILE_SIZE = "TILE_SIZE"
     N_WORKERS = "N_WORKERS"
-    MAX_FEATHER_PX = "MAX_FEATHER_PX"
     K_MAD = "K_MAD"
     MAX_DROPOUT_FRAC = "MAX_DROPOUT_FRAC"
     MAX_STRIPE_RATIO = "MAX_STRIPE_RATIO"
@@ -382,27 +381,6 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             | QgsProcessingParameterDefinition.FlagAdvanced)
         self.addParameter(workers_param)
 
-        feather_param = QgsProcessingParameterNumber(
-            self.MAX_FEATHER_PX,
-            self.tr("Max feather pixels (used by v4 and v5 mosaic methods)"),
-            type=Integer,
-            defaultValue=32,
-            minValue=0,
-        )
-        feather_param.setHelp(self.tr(
-            "Width (in pixels) of the distance-to-edge ramp used by the "
-            "v4 feathered mosaic method and reused by v5 (histogram "
-            "match + feather). Pixels deeper than this inside a frame "
-            "get full weight; closer to the edge they fade to zero, "
-            "which is what hides the seams. Ignored by v1. Default 32. "
-            "Warning: v5 alters per-pixel spectral values — use only "
-            "when visual continuity matters more than spectral accuracy."
-        ))
-        feather_param.setFlags(
-            feather_param.flags()
-            | QgsProcessingParameterDefinition.FlagAdvanced)
-        self.addParameter(feather_param)
-
         # Roadmap item #2: only used when the user picks the v2 adaptive
         # MAD filter method. Ignored by v1, so adding this parameter is
         # backwards compatible.
@@ -561,8 +539,6 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             parameters, self.TILE_SIZE, context)
         n_workers = self.parameterAsInt(
             parameters, self.N_WORKERS, context)
-        max_feather_px = self.parameterAsInt(
-            parameters, self.MAX_FEATHER_PX, context)
         k_mad = self.parameterAsDouble(
             parameters, self.K_MAD, context)
         max_dropout_frac = self.parameterAsDouble(
@@ -691,7 +667,6 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
                 max_dropout_frac=float(max_dropout_frac),
                 max_stripe_ratio=float(max_stripe_ratio),
                 mosaic_func=mosaic_func,
-                max_feather_pixels=int(max_feather_px),
                 gap_fill_func=gap_fill_func,
                 fill_only_interior=fill_only_interior,
                 max_interior_gap_px=int(max_interior_gap_px),

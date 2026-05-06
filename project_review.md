@@ -40,7 +40,7 @@ The five algorithms appear in **Processing Toolbox → Hyperspectral gaps filler
 
 **Method registries (driven by [`methods.py`](methods.py:1), one entry per implemented version):**
 - `FRAME_FILTER_METHODS` — `v1_hard_thresholds` (default), `v2_adaptive_mad` (per-flight adaptive MAD thresholds), `v3_per_band` (per-band striping / dropout detection).
-- `MOSAIC_METHODS` — `v1_first_write_wins` (default), `v4_feather` (feathered / weighted blending), `v5_histmatch_feather` (linear mean/std histogram match against the first input frame, then v4 feather — visual-only; ⚠️ alters per-pixel spectra).
+- `MOSAIC_METHODS` — `v1_first_write_wins` only. The visual-only `v4_feather` and `v5_histmatch_feather` variants were unregistered (see "Project policy — data correctness over visual appearance" below) so the only reachable mosaic path is spectrally exact.
 - `GAP_FILL_METHODS` — `v2_idw_quadrants` (default, pure-Python), `v3_gdal_fillnodata` (native C, optional fallback to v2 on failure).
 
 **QGIS algorithm parameters now exposed:**
@@ -192,3 +192,57 @@ Follow-up cleanup after the three method registries shipped: every place that st
 
 **Terminology sweep.**
 - Module / class docstrings, comments and a couple of `shortHelpString` strings reworded where they implied a single fixed method per stage. Touched: [`pipeline.py`](pipeline.py:1) (already accurate, left as-is), [`frame_filter.py`](frame_filter.py:2) module docstring (Public API now lists v1 / v2 / v3 batch wrappers; rejection heuristic flagged as method-dependent), [`mosaic.py`](mosaic.py:2) module docstring (overlap strategy is method-dependent — v1 / v4 / v5 — Public API lists all three callables), [`fill_nodata.py`](fill_nodata.py:2) module docstring (now describes both v2 IDW and v3 gdal.FillNodata as registered backends instead of claiming the module *is* a pure-Python re-implementation), [`mosaic_algorithm.py`](mosaic_algorithm.py:2) module docstring (notes that the display name keeps its historical `first-write-wins` wording for Model Builder backwards compat), [`gaps_filler_algorithm.py`](gaps_filler_algorithm.py:82) `shortHelpString` (mentions both v2 / v3 backends), [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py:125) `shortHelpString` + the stale "currently always uses the implemented v1/v1/v2 path" comment near [`processAlgorithm`](hyperspectral_algorithm.py:638). `QgsProcessingAlgorithm.name()` / `displayName()` / `groupId()` / parameter descriptions were intentionally left untouched (saved Model Builder graphs reference them by string).
+
+## Project policy — data correctness over visual appearance
+
+Reliability and correctness of pixel values is more important than the
+visual appearance of the mosaic. Visible seams in overlap regions are
+accepted as the cost of preserving exact per-pixel spectra. Any future
+mosaic option that mixes / rescales / interpolates spectral values
+across frames (feathering, histogram matching, blending, etc.) must
+**not** be registered as the production path; it may exist only as an
+unregistered helper or as an explicit, clearly-flagged experimental
+extra. Index 0 of [`MOSAIC_METHODS`](methods.py:84) must always be the
+spectrally-faithful path.
+
+## Changelog — 2026-05-06 visual-mosaic removal
+
+Global change to align the codebase with the policy above. Only the
+exact-data `v1_first_write_wins` mosaic path remains reachable; the
+two visual-only variants were unregistered with the smallest safe
+edit possible.
+
+- [`methods.py`](methods.py:84) — `MOSAIC_METHODS` trimmed to the single
+  `v1_first_write_wins` entry; the `v4_feather` and `v5_histmatch_feather`
+  entries (which mixed/altered per-pixel spectra) were removed so the
+  QGIS dropdown can no longer dispatch to them. Tooltip rewritten to
+  explain that visible seams are an accepted cost of exact-data
+  preservation.
+- [`mosaic.py`](mosaic.py:1) — module docstring updated to state that
+  only `v1` is registered. The helper functions
+  [`_feather_weights()`](mosaic.py:361),
+  [`mosaic_frames_feather()`](mosaic.py:383) and
+  [`mosaic_frames_histmatch_feather()`](mosaic.py:607) are intentionally
+  left in the file as unreachable dead code (no caller imports them
+  anymore) — the smallest-safe-change rule won out over a full delete,
+  and a future reviewer can drop them in a follow-up.
+- [`mosaic_algorithm.py`](mosaic_algorithm.py:1) — removed the
+  `MAX_FEATHER_PX` parameter (UI knob and class constant), the
+  feather-only `extra_kwargs` dispatch, and the v4/v5 mentions in the
+  module docstring + `shortHelpString`. The algorithm now always calls
+  the registered method with `(paths, out_path, progress, reproject_to_first)`.
+- [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py:1) — same
+  cleanup: dropped the `MAX_FEATHER_PX` class constant + parameter
+  declaration, the `parameterAsInt` read, and the `max_feather_pixels`
+  kwarg forwarded into [`pipeline.run_pipeline()`](pipeline.py:166).
+- [`pipeline.py`](pipeline.py:166) — removed the `max_feather_pixels`
+  kwarg and the `if mosaic_func in (mosaic_frames_feather, mosaic_frames_histmatch_feather)`
+  conditional dispatch. Stage B now always calls the mosaic func with
+  the v1 signature `(good, mosaic_path, progress=..., reproject_to_first=...)`.
+- No QGIS algorithm `name()` / `displayName()` / `groupId()` was
+  touched; saved Model Builder graphs that reference the Mosaic / Pipeline
+  algorithms keep resolving. Saved graphs that explicitly set
+  `MAX_FEATHER_PX` or selected mosaic indices 1 / 2 will silently
+  ignore the now-unknown parameter / fall back to index 0 — both are
+  acceptable degradations.
+- Verification: `python3 -m py_compile methods.py mosaic.py mosaic_algorithm.py hyperspectral_algorithm.py pipeline.py` succeeded; project-wide regex sweep for `MAX_FEATHER_PX|max_feather_pixels|mosaic_frames_feather|mosaic_frames_histmatch|v4_feather|v5_histmatch` finds matches only inside [`mosaic.py`](mosaic.py:1) (the unreachable helpers), confirming no other importer / registration site references the removed paths.
