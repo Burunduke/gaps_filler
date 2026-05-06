@@ -507,9 +507,9 @@ def _fill_band_windowed(in_band, out_band, ext_mask_arr,
 def _fill_band_worker(input_path, b, mask_path,
                       max_search_dist, smoothing_iterations,
                       tile_size=0):
-    """Top-level worker (one band per call) for :class:`ProcessPoolExecutor`.
+    """Top-level worker (one band per call) for :class:`ThreadPoolExecutor`.
 
-    Each worker process re-opens the input raster, reads its assigned
+    Each worker re-opens the input raster, reads its assigned
     band plus (if given) the validity mask, runs the gap-fill, and
     returns ``(b, filled, nodata)``. Re-opening per call keeps every
     worker independent -- one process per band, no shared GDAL state
@@ -525,8 +525,8 @@ def _fill_band_worker(input_path, b, mask_path,
     handle to the real output GeoTIFF. When ``tile_size == 0`` the
     worker takes the original whole-band path: read, fill, return.
 
-    The function is at module top level so :mod:`pickle` (used by
-    :class:`ProcessPoolExecutor`) can serialise it.
+    The function is kept at module top level (harmless for threads,
+    and future-proof in case we ever go back to a process pool).
     """
     from osgeo import gdal  # local import: workers spawn fresh interpreters
     src = gdal.Open(input_path, gdal.GA_ReadOnly)
@@ -553,9 +553,9 @@ def _fill_band_worker(input_path, b, mask_path,
         mem_ds = mem_drv.Create(
             "", in_band.XSize, in_band.YSize, 1, in_band.DataType)
         out_band = mem_ds.GetRasterBand(1)
-        # b=1, band_count=1, feedback=None: per-tile progress can't
-        # be threaded out of a worker process anyway (parent reports
-        # per-band-completion progress instead).
+        # b=1, band_count=1, feedback=None: per-tile progress isn't
+        # plumbed out of a worker (parent reports per-band-completion
+        # progress instead).
         _fill_band_windowed(
             in_band, out_band, mask,
             max_search_dist, smoothing_iterations,
@@ -610,19 +610,19 @@ def fill_nodata_file(input_path, output_path,
         in ``hyperspectral_plan.md``). ``0`` (the default) reproduces
         the legacy whole-band behaviour byte-for-byte.
     n_workers : int, default 1
-        Number of worker processes for the per-band fill (Pipeline
+        Number of worker threads for the per-band fill (Pipeline
         TO-DO item #9 in ``hyperspectral_plan.md``). ``1`` (the default)
         runs the legacy in-process loop byte-for-byte. ``> 1`` dispatches
-        bands to a :class:`concurrent.futures.ProcessPoolExecutor` --
-        bands are independent, and one process per band keeps GDAL
+        bands to a :class:`concurrent.futures.ThreadPoolExecutor` --
+        bands are independent, and each thread re-opens the input so GDAL
         thread-safe (each worker re-opens the input). Honoured for both
         whole-band (``tile_size == 0``) and tiled (``tile_size > 0``)
         modes; in the tiled+parallel mode each band is still processed
         tile-by-tile *inside* its worker, but bands run concurrently.
         Progress is reported per band-completion (one tick per band that
-        finishes) in the parallel mode -- per-tile progress can't be
-        threaded out of a worker process and the extra plumbing isn't
-        worth it for the band-level granularity users actually see.
+        finishes) in the parallel mode -- per-tile progress isn't plumbed
+        out of a worker thread and the extra plumbing isn't worth it for
+        the band-level granularity users actually see.
     """
     from osgeo import gdal  # local import: keep plugin import-time light
 
@@ -700,18 +700,22 @@ def fill_nodata_file(input_path, output_path,
                 int(max_search_dist) + int(smoothing_iterations)))
 
     # Pipeline TO-DO item #9: parallelise the per-band loop with
-    # :class:`concurrent.futures.ProcessPoolExecutor` when the caller
-    # asks for it. One process per band keeps GDAL thread-safe (each
-    # worker re-opens the input in its own interpreter). Both
-    # whole-band and tiled fills parallelise: in the tiled+parallel
+    # :class:`concurrent.futures.ThreadPoolExecutor` when the caller
+    # asks for it. Threads avoid the Windows ``spawn`` start method
+    # re-importing QGIS in each worker (which crashed the process pool
+    # with "A process in the process pool was terminated abruptly").
+    # GDAL releases the GIL during heavy I/O and our pattern of "each
+    # worker re-opens the input" already gives every thread its own
+    # GDAL dataset handle, so threads don't race on a shared dataset.
+    # Both whole-band and tiled fills parallelise: in the tiled+parallel
     # mode each worker still tiles its band sequentially via
     # `_fill_band_windowed`, but bands run concurrently. Progress is
     # reported per band-completion in the parallel mode (per-tile
-    # progress can't be threaded out of a worker process).
+    # progress isn't plumbed out of a worker thread).
     use_workers = int(n_workers) > 1
     if feedback is not None and use_workers:
         feedback.pushInfo(
-            "Parallel fill: {} worker process(es){}".format(
+            "Parallel fill: {} worker thread(s){}".format(
                 int(n_workers),
                 " (tiled inside each worker)" if use_tiles else ""))
 
@@ -721,12 +725,12 @@ def fill_nodata_file(input_path, output_path,
         # band, returned as one filled array). Submit every band, then
         # write results as they come back so big cubes don't keep all
         # filled arrays in RAM at once.
-        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         # Close the source dataset so workers see a clean file handle
-        # on Windows (and so we don't hold an extra fd open for nothing).
+        # (and so we don't hold an extra fd open for nothing).
         src = None
         bands_done = 0
-        with ProcessPoolExecutor(max_workers=int(n_workers)) as pool:
+        with ThreadPoolExecutor(max_workers=int(n_workers)) as pool:
             futures = {
                 pool.submit(_fill_band_worker,
                             input_path, b, mask_path,

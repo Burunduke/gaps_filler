@@ -326,7 +326,7 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
         )
         workers_param.setHelp(self.tr(
             "When > 1, Stage C dispatches the per-band fill to a "
-            "ProcessPoolExecutor with one process per band (bands are "
+            "ThreadPoolExecutor with one thread per band (bands are "
             "independent). 1 (the default) keeps the legacy in-process "
             "loop. Ignored when 'Tile size' > 0 (tiled mode runs "
             "sequentially) and by the v3 backend (gdal.FillNodata is "
