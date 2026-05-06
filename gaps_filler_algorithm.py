@@ -19,7 +19,28 @@ from qgis.core import (
     QgsProcessingParameterRasterLayer,
 )
 
-from . import fill_nodata, methods
+from . import canvas_styling, fill_nodata, methods
+
+
+def _default_output_path(input_path, suffix):
+    """Derive ``<input_dir>/<input_stem><suffix>`` as a default OUTPUT.
+
+    Pipeline TO-DO #14: when the user leaves the OUTPUT field empty
+    (or QGIS pre-fills it with ``TEMPORARY_OUTPUT``), drop the result
+    next to the input instead of forcing them to type a path.
+    """
+    folder = os.path.dirname(os.path.abspath(input_path))
+    stem, _ext = os.path.splitext(os.path.basename(input_path))
+    return os.path.join(folder, stem + suffix)
+
+
+def _is_empty_output(raw):
+    """Return True when the user gave no real OUTPUT value."""
+    if raw is None:
+        return True
+    if isinstance(raw, str) and (not raw or raw == "TEMPORARY_OUTPUT"):
+        return True
+    return False
 
 
 class FillNoDataAlgorithm(QgsProcessingAlgorithm):
@@ -191,8 +212,25 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
         iters = self.parameterAsInt(parameters, self.ITERATIONS, context)
         mask_lyr = self.parameterAsRasterLayer(
             parameters, self.MASK_LAYER, context)
+        # Pipeline TO-DO #14: derive a default output path from the
+        # input file when the user leaves OUTPUT empty.
+        if _is_empty_output(parameters.get(self.OUTPUT)):
+            default = _default_output_path(
+                src_layer.source(), "_filled.tif")
+            parameters[self.OUTPUT] = default
+            feedback.pushInfo(
+                "Output path empty; defaulting to {}".format(default))
         out_path = self.parameterAsOutputLayer(
             parameters, self.OUTPUT, context)
+
+        # Pipeline TO-DO #15: when QGIS will auto-load the result onto
+        # the canvas, swap the default grayscale-band-1 renderer for an
+        # RGB composite picked from the input cube's band count.
+        if context.willLoadLayerOnCompletion(out_path):
+            details = context.layerToLoadOnCompletion(out_path)
+            self._rgb_post_processor = (
+                canvas_styling.attach_rgb_post_processor(
+                    details, src_layer.bandCount()))
         fill_only_interior = self.parameterAsBoolean(
             parameters, self.FILL_ONLY_INTERIOR, context)
         max_interior_gap_px = self.parameterAsInt(

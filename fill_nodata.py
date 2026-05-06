@@ -505,16 +505,25 @@ def _fill_band_windowed(in_band, out_band, ext_mask_arr,
 
 
 def _fill_band_worker(input_path, b, mask_path,
-                      max_search_dist, smoothing_iterations):
+                      max_search_dist, smoothing_iterations,
+                      tile_size=0):
     """Top-level worker (one band per call) for :class:`ProcessPoolExecutor`.
 
     Each worker process re-opens the input raster, reads its assigned
-    band plus (if given) the validity mask, runs the array-level
-    :func:`fill_nodata`, and returns ``(b, filled, nodata)``. Re-opening
-    per call keeps every worker independent -- one process per band, no
-    shared GDAL state across processes -- as required by Pipeline TO-DO
-    item #9 in ``hyperspectral_plan.md`` ("Watch GDAL thread-safety:
-    keep one process per band.").
+    band plus (if given) the validity mask, runs the gap-fill, and
+    returns ``(b, filled, nodata)``. Re-opening per call keeps every
+    worker independent -- one process per band, no shared GDAL state
+    across processes -- as required by Pipeline TO-DO item #9 in
+    ``hyperspectral_plan.md`` ("Watch GDAL thread-safety: keep one
+    process per band.").
+
+    When ``tile_size > 0`` the worker dispatches to
+    :func:`_fill_band_windowed` against an in-memory (``MEM`` driver)
+    output sink so the existing tile-with-halo logic runs unchanged --
+    the worker reads the input tile-by-tile and returns one fully
+    filled band array to the parent, which owns the only writable
+    handle to the real output GeoTIFF. When ``tile_size == 0`` the
+    worker takes the original whole-band path: read, fill, return.
 
     The function is at module top level so :mod:`pickle` (used by
     :class:`ProcessPoolExecutor`) can serialise it.
@@ -525,8 +534,6 @@ def _fill_band_worker(input_path, b, mask_path,
         raise IOError("Cannot open {}".format(input_path))
     in_band = src.GetRasterBand(b)
     nodata = in_band.GetNoDataValue()
-    arr = in_band.ReadAsArray()
-    src = None
 
     mask = None
     if mask_path:
@@ -537,14 +544,35 @@ def _fill_band_worker(input_path, b, mask_path,
         msrc = None
         mask = marr != 0
 
-    filled = fill_nodata(
-        arr,
-        mask=mask,
-        max_search_dist=max_search_dist,
-        smoothing_iterations=smoothing_iterations,
-        nodata=nodata,
-        feedback=None,  # per-worker feedback would garble the parent log
-    )
+    if int(tile_size) > 0:
+        # Tiled path: keep IO bounded inside the worker by reusing
+        # the existing `_fill_band_windowed` helper. Output goes to
+        # a MEM dataset because the parent owns the on-disk output;
+        # the worker hands the parent a single filled band array.
+        mem_drv = gdal.GetDriverByName("MEM")
+        mem_ds = mem_drv.Create(
+            "", in_band.XSize, in_band.YSize, 1, in_band.DataType)
+        out_band = mem_ds.GetRasterBand(1)
+        # b=1, band_count=1, feedback=None: per-tile progress can't
+        # be threaded out of a worker process anyway (parent reports
+        # per-band-completion progress instead).
+        _fill_band_windowed(
+            in_band, out_band, mask,
+            max_search_dist, smoothing_iterations,
+            nodata, int(tile_size), None, 1, 1)
+        filled = out_band.ReadAsArray()
+        mem_ds = None
+    else:
+        arr = in_band.ReadAsArray()
+        filled = fill_nodata(
+            arr,
+            mask=mask,
+            max_search_dist=max_search_dist,
+            smoothing_iterations=smoothing_iterations,
+            nodata=nodata,
+            feedback=None,  # per-worker feedback would garble the parent log
+        )
+    src = None
     return b, filled, nodata
 
 
@@ -587,9 +615,14 @@ def fill_nodata_file(input_path, output_path,
         runs the legacy in-process loop byte-for-byte. ``> 1`` dispatches
         bands to a :class:`concurrent.futures.ProcessPoolExecutor` --
         bands are independent, and one process per band keeps GDAL
-        thread-safe (each worker re-opens the input). Ignored when
-        ``tile_size > 0`` (the per-tile feedback / progress mapping
-        depends on a single-process iteration order; logged as a no-op).
+        thread-safe (each worker re-opens the input). Honoured for both
+        whole-band (``tile_size == 0``) and tiled (``tile_size > 0``)
+        modes; in the tiled+parallel mode each band is still processed
+        tile-by-tile *inside* its worker, but bands run concurrently.
+        Progress is reported per band-completion (one tick per band that
+        finishes) in the parallel mode -- per-tile progress can't be
+        threaded out of a worker process and the extra plumbing isn't
+        worth it for the band-level granularity users actually see.
     """
     from osgeo import gdal  # local import: keep plugin import-time light
 
@@ -669,24 +702,23 @@ def fill_nodata_file(input_path, output_path,
     # Pipeline TO-DO item #9: parallelise the per-band loop with
     # :class:`concurrent.futures.ProcessPoolExecutor` when the caller
     # asks for it. One process per band keeps GDAL thread-safe (each
-    # worker re-opens the input in its own interpreter). The whole-band
-    # path is the only one that parallelises -- the tiled path's
-    # per-tile feedback / progress mapping is built around a single
-    # in-process iteration, so we keep it sequential and just log a
-    # one-line note when ``n_workers > 1`` is supplied alongside tiles.
-    use_workers = int(n_workers) > 1 and not use_tiles
-    if feedback is not None:
-        if use_workers:
-            feedback.pushInfo(
-                "Parallel fill: {} worker process(es)".format(int(n_workers)))
-        elif int(n_workers) > 1 and use_tiles:
-            feedback.pushInfo(
-                "Note: n_workers={} ignored when tile_size > 0; "
-                "tiled mode runs sequentially.".format(int(n_workers)))
+    # worker re-opens the input in its own interpreter). Both
+    # whole-band and tiled fills parallelise: in the tiled+parallel
+    # mode each worker still tiles its band sequentially via
+    # `_fill_band_windowed`, but bands run concurrently. Progress is
+    # reported per band-completion in the parallel mode (per-tile
+    # progress can't be threaded out of a worker process).
+    use_workers = int(n_workers) > 1
+    if feedback is not None and use_workers:
+        feedback.pushInfo(
+            "Parallel fill: {} worker process(es){}".format(
+                int(n_workers),
+                " (tiled inside each worker)" if use_tiles else ""))
 
     if use_workers:
         # Parent stays single-threaded for GDAL writes; workers only
-        # read and run the array-level fill. Submit every band, then
+        # read and run the array-level fill (or tiled fill into a MEM
+        # band, returned as one filled array). Submit every band, then
         # write results as they come back so big cubes don't keep all
         # filled arrays in RAM at once.
         from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -698,7 +730,8 @@ def fill_nodata_file(input_path, output_path,
             futures = {
                 pool.submit(_fill_band_worker,
                             input_path, b, mask_path,
-                            max_search_dist, smoothing_iterations): b
+                            max_search_dist, smoothing_iterations,
+                            int(tile_size)): b
                 for b in range(1, band_count + 1)
             }
             try:

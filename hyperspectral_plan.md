@@ -462,49 +462,51 @@ commercial-grade tool. Ordered roughly by ROI.
   (e.g. 2048×2048 with `max_distance` overlap) instead of full-band
   arrays — current code holds an entire band in RAM (~hundreds of MB
   per band on big flights). (done 2026-05-05)
-- [ ] **Parallelise per-band loop** in
+- [x] **Parallelise per-band loop** in
   [`pipeline.run_pipeline()`](pipeline.py:89) with
   `concurrent.futures.ProcessPoolExecutor` (bands are independent).
-  Watch GDAL thread-safety: keep one process per band.
-- [ ] **Skip redundant frame opens** in
+  Watch GDAL thread-safety: keep one process per band. (done 2026-05-05)
+  - [x] Tiled + parallel mode supported (parallelism across bands,
+    sequential tiles within band) — done 2026-05-05
+- [x] **Skip redundant frame opens** in
   [`mosaic.mosaic_frames()`](mosaic.py:96) — currently re-opens every
   source per band. Use `rasterio.open` once and pass `indexes=[b]`
-  per band; close after the whole loop. Profile fd usage first.
+  per band; close after the whole loop. Profile fd usage first. (done 2026-05-05)
 
 
 ### Usability (QGIS)
 
-- [ ] **Honour `feedback.isCanceled()`** between frames in Stage A and
+- [x] **Honour `feedback.isCanceled()`** between frames in Stage A and
   between bands in Stages B and C — currently a multi-minute run can
-  not be cancelled cleanly.
-- [ ] **Granular progress** in
+  not be cancelled cleanly. (done 2026-05-05)
+- [x] **Granular progress** in
   [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:22):
   forward [`pipeline.run_pipeline()`](pipeline.py:37)'s `progress` to
   `feedback.setProgress`; current 0.05 / 0.65 / 0.30 split is OK, just
-  wire it.
-- [ ] **Threshold presets** — add a dropdown ("Permissive / Default /
+  wire it. (done 2026-05-05)
+- [x] **Threshold presets** — add a dropdown ("Permissive / Default /
   Strict") in [`FrameFilterAlgorithm`](frame_filter_algorithm.py:24)
   alongside the 8 raw threshold inputs so junior users don't have to
-  understand each knob.
-- [ ] **Default output path** — derive from input folder when
-  `OUTPUT` is empty, instead of forcing the user to type a path.
-- [ ] **Auto-add result to canvas** with sensible band combination
-  (e.g. RGB-equivalent indices for PIKA-L) instead of grayscale band 1.
+  understand each knob. (done 2026-05-05)
+- [x] **Default output path** — derive from input folder when
+  `OUTPUT` is empty, instead of forcing the user to type a path. (done 2026-05-05)
+- [x] **Auto-add result to canvas** with sensible band combination
+  (e.g. RGB-equivalent indices for PIKA-L) instead of grayscale band 1. (done 2026-05-06)
 
 ### Maintenance
 
-- [ ] **Pin `rasterio` minimum version** in [`metadata.txt`](metadata.txt:1)
-  (`rasterio.merge.merge` `dtype=`/`nodata=` kwargs need ≥ 1.3).
-- [ ] **Document the temp-file convention** (`<output>.mosaic.tif`,
+- [x] **Pin `rasterio` minimum version** in [`metadata.txt`](metadata.txt:1)
+  (`rasterio.merge.merge` `dtype=`/`nodata=` kwargs need ≥ 1.3). (done 2026-05-06)
+- [x] **Document the temp-file convention** (`<output>.mosaic.tif`,
   see [`pipeline.py`](pipeline.py:65)) and ensure cleanup on
-  `KeyboardInterrupt` / cancellation, not only on success.
-- [ ] **Add a "dry run" mode** to
+  `KeyboardInterrupt` / cancellation, not only on success. (done 2026-05-06)
+- [x] **Add a "dry run" mode** to
   [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:22)
   that runs Stage A only and reports kept/rejected counts — saves
-  iteration time when tuning thresholds.
-- [ ] **Resolve placeholder URLs** in [`metadata.txt`](metadata.txt:1)
+  iteration time when tuning thresholds. (done 2026-05-06)
+- [x] **Resolve placeholder URLs** in [`metadata.txt`](metadata.txt:1)
   (`tracker`, `repository`, `homepage`) — still flagged in
-  [`project_review.md`](project_review.md:1).
+  [`project_review.md`](project_review.md:1). (done 2026-05-06)
 
 ### Quality
 

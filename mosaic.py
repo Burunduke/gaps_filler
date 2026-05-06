@@ -278,11 +278,19 @@ def mosaic_frames(
 
     try:
         with rasterio.open(output_path, "w", **profile) as dst:
-            for b in range(1, band_count + 1):
-                combined = None  # type: Optional[np.ndarray]
-                for chunk in path_chunks:
-                    sources = [rasterio.open(p) for p in chunk]
-                    try:
+            # Pipeline TO-DO #10: open every source in a chunk exactly
+            # once and reuse the readers across all bands, instead of
+            # re-opening every source per band. Loops are inverted so
+            # that the chunk loop is outer and the band loop is inner.
+            # First-write-wins across chunks is preserved by reading the
+            # already-written band back from ``dst`` for chunks after
+            # the first and filling only where it is still NaN.
+            total_steps = len(path_chunks) * band_count
+            step = 0
+            for chunk_idx, chunk in enumerate(path_chunks):
+                sources = [rasterio.open(p) for p in chunk]
+                try:
+                    for b in range(1, band_count + 1):
                         chunk_arr, _ = merge(
                             sources,
                             indexes=[b],
@@ -292,30 +300,33 @@ def mosaic_frames(
                             res=(xres, yres),
                             bounds=out_bounds,
                         )
-                    finally:
-                        for s in sources:
-                            s.close()
+                        if chunk_arr.dtype != np.float32:
+                            chunk_arr = chunk_arr.astype(np.float32)
+                        arr = chunk_arr[0]
+                        if src_nodata is not None and not nodata_is_nan:
+                            arr[arr == np.float32(src_nodata)] = nan
 
-                    if chunk_arr.dtype != np.float32:
-                        chunk_arr = chunk_arr.astype(np.float32)
+                        if chunk_idx == 0:
+                            dst.write(arr, b)
+                        else:
+                            # First-write-wins across chunks: only fill
+                            # where earlier chunks left NaN.
+                            existing = dst.read(b)
+                            mask = np.isnan(existing)
+                            existing[mask] = arr[mask]
+                            dst.write(existing, b)
 
-                    if combined is None:
-                        combined = chunk_arr
-                    else:
-                        # First-write-wins across chunks: only fill where
-                        # the earlier chunks left NaN.
-                        mask = np.isnan(combined)
-                        combined[mask] = chunk_arr[mask]
-
-                arr = combined
-                if src_nodata is not None and not nodata_is_nan:
-                    arr[arr == np.float32(src_nodata)] = nan
-
-                dst.write(arr[0], b)
-
-                if progress is not None:
-                    progress(
-                        b / band_count, "band {}/{}".format(b, band_count))
+                        step += 1
+                        if progress is not None:
+                            progress(
+                                step / total_steps,
+                                "chunk {}/{} band {}/{}".format(
+                                    chunk_idx + 1, len(path_chunks),
+                                    b, band_count),
+                            )
+                finally:
+                    for s in sources:
+                        s.close()
 
             if descriptions:
                 for i, desc in enumerate(descriptions, start=1):

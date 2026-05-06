@@ -45,6 +45,17 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
     OUTPUT_FOLDER = "OUTPUT_FOLDER"
     REPORT = "REPORT"
     FRAME_FILTER_METHOD = "FRAME_FILTER_METHOD"
+    THRESHOLD_PRESET = "THRESHOLD_PRESET"
+
+    # Order matches the dropdown shown in QGIS. Index 0 keeps the
+    # historical "use the eight raw inputs below" behaviour so existing
+    # users / scripts that don't set the preset see no change.
+    PRESET_CHOICES = [
+        ("custom", "Custom (use values below)"),
+        ("permissive", "Permissive"),
+        ("default", "Default"),
+        ("strict", "Strict"),
+    ]
 
     SKEW_MAX = "SKEW_MAX"
     AREA_LO = "AREA_LO"
@@ -104,6 +115,29 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
         method_param.setHelp(methods.tooltip_block(
             methods.FRAME_FILTER_METHODS))
         self.addParameter(method_param)
+
+        # Pipeline TO-DO #13: a single dropdown that overrides the eight
+        # raw threshold inputs with a named bundle. "Custom" keeps the
+        # raw inputs (default), so adding this parameter is backwards
+        # compatible.
+        preset_param = QgsProcessingParameterEnum(
+            self.THRESHOLD_PRESET,
+            self.tr("Threshold preset"),
+            options=[label for _, label in self.PRESET_CHOICES],
+            defaultValue=0,
+        )
+        preset_param.setHelp(self.tr(
+            "Pick a named bundle of all eight thresholds instead of "
+            "tuning each one. 'Custom' uses the raw values below "
+            "(unchanged behaviour). 'Permissive' relaxes every "
+            "threshold (use when v1 over-rejects on a new sensor). "
+            "'Default' matches the documented PIKA-L defaults. "
+            "'Strict' tightens every threshold (clean acquisitions, "
+            "drop on any doubt). When a non-Custom preset is chosen "
+            "the raw threshold inputs below are ignored."
+        ))
+        self.addParameter(preset_param)
+
         self.addParameter(
             QgsProcessingParameterFolderDestination(
                 self.OUTPUT_FOLDER,
@@ -171,24 +205,36 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
         report_path = self.parameterAsFileOutput(
             parameters, self.REPORT, context)
 
-        thresholds = FilterThresholds(
-            skew_max=self.parameterAsDouble(
-                parameters, self.SKEW_MAX, context),
-            area_lo=self.parameterAsDouble(
-                parameters, self.AREA_LO, context),
-            area_hi=self.parameterAsDouble(
-                parameters, self.AREA_HI, context),
-            aspect_max=self.parameterAsDouble(
-                parameters, self.ASPECT_MAX, context),
-            centre_window=self.parameterAsInt(
-                parameters, self.CENTRE_WINDOW, context),
-            min_valid_fraction=self.parameterAsDouble(
-                parameters, self.MIN_VALID_FRACTION, context),
-            std_min=self.parameterAsDouble(
-                parameters, self.STD_MIN, context),
-            saturation_fraction=self.parameterAsDouble(
-                parameters, self.SATURATION_FRACTION, context),
-        )
+        preset_idx = self.parameterAsEnum(
+            parameters, self.THRESHOLD_PRESET, context)
+        preset_id, preset_label = self.PRESET_CHOICES[preset_idx]
+        if preset_id == "custom":
+            thresholds = FilterThresholds(
+                skew_max=self.parameterAsDouble(
+                    parameters, self.SKEW_MAX, context),
+                area_lo=self.parameterAsDouble(
+                    parameters, self.AREA_LO, context),
+                area_hi=self.parameterAsDouble(
+                    parameters, self.AREA_HI, context),
+                aspect_max=self.parameterAsDouble(
+                    parameters, self.ASPECT_MAX, context),
+                centre_window=self.parameterAsInt(
+                    parameters, self.CENTRE_WINDOW, context),
+                min_valid_fraction=self.parameterAsDouble(
+                    parameters, self.MIN_VALID_FRACTION, context),
+                std_min=self.parameterAsDouble(
+                    parameters, self.STD_MIN, context),
+                saturation_fraction=self.parameterAsDouble(
+                    parameters, self.SATURATION_FRACTION, context),
+            )
+            feedback.pushInfo(
+                "Threshold preset: {} (using raw values below)".format(
+                    preset_label))
+        else:
+            thresholds = frame_filter.preset_thresholds(preset_id)
+            feedback.pushInfo(
+                "Threshold preset: {} (raw threshold inputs ignored)"
+                .format(preset_label))
 
         paths = [lyr.source() for lyr in layers]
 
@@ -199,8 +245,16 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
             "Frame filter method: {}".format(method_entry["id"]))
 
         try:
+            # Pipeline TO-DO #11: forward QGIS cancellation so the filter
+            # function checks ``feedback.isCanceled`` between frames in
+            # both passes and aborts cleanly on user cancel.
             good, rejected = method_entry["func"](
-                paths, thresholds=thresholds)
+                paths, thresholds=thresholds,
+                is_canceled=feedback.isCanceled)
+        except RuntimeError as exc:
+            if str(exc) == "canceled":
+                raise QgsProcessingException(self.tr("Canceled by user"))
+            raise QgsProcessingException(str(exc))
         except Exception as exc:
             raise QgsProcessingException(str(exc))
 

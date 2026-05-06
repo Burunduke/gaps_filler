@@ -5,6 +5,8 @@ Exposes Stage B of the hyperspectral pipeline (first-write-wins mosaic of
 already-filtered frames) as a standalone QGIS Processing algorithm.
 """
 
+import os
+
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
@@ -16,7 +18,27 @@ from qgis.core import (
     QgsProcessingParameterRasterDestination,
 )
 
-from . import methods, mosaic
+from . import canvas_styling, methods, mosaic
+
+
+def _default_mosaic_output(input_paths):
+    """Derive ``<first_input_dir>/mosaic.tif`` as a default OUTPUT.
+
+    Pipeline TO-DO #14: when the user leaves OUTPUT empty, save the
+    mosaic next to the first input frame instead of forcing them to
+    type a path.
+    """
+    folder = os.path.dirname(os.path.abspath(input_paths[0]))
+    return os.path.join(folder, "mosaic.tif")
+
+
+def _is_empty_output(raw):
+    """Return True when the user gave no real OUTPUT value."""
+    if raw is None:
+        return True
+    if isinstance(raw, str) and (not raw or raw == "TEMPORARY_OUTPUT"):
+        return True
+    return False
 
 
 class MosaicAlgorithm(QgsProcessingAlgorithm):
@@ -95,9 +117,28 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(
                 self.tr("No input frames provided"))
 
+        paths = [lyr.source() for lyr in layers]
+
+        # Pipeline TO-DO #14: derive a default output path from the
+        # first input frame's folder when OUTPUT is empty.
+        if _is_empty_output(parameters.get(self.OUTPUT)):
+            default = _default_mosaic_output(paths)
+            parameters[self.OUTPUT] = default
+            feedback.pushInfo(
+                "Output path empty; defaulting to {}".format(default))
         out_path = self.parameterAsOutputLayer(
             parameters, self.OUTPUT, context)
-        paths = [lyr.source() for lyr in layers]
+
+        # Pipeline TO-DO #15: queue an RGB-composite post-processor so
+        # the auto-loaded mosaic shows a colour view (PIKA-L cubes
+        # default to a near-black band-1 in grayscale otherwise). The
+        # mosaic preserves the input band count, so we read it from
+        # the first input layer.
+        if context.willLoadLayerOnCompletion(out_path):
+            details = context.layerToLoadOnCompletion(out_path)
+            self._rgb_post_processor = (
+                canvas_styling.attach_rgb_post_processor(
+                    details, layers[0].bandCount()))
 
         def cb(fraction, message):
             if feedback.isCanceled():

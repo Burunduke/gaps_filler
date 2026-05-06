@@ -19,6 +19,7 @@ in particular this module must not import ``osgeo.gdal`` or ``qgis``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable, Optional
 
 import numpy as np
 import rasterio
@@ -52,6 +53,59 @@ class FilterThresholds:
     min_valid_fraction: float = MIN_VALID_FRACTION
     std_min: float = STD_MIN
     saturation_fraction: float = SATURATION_FRACTION
+
+
+# ---------------------------------------------------------------------------
+# Threshold presets (Pipeline TO-DO #13 in ``hyperspectral_plan.md``).
+#
+# Three named bundles let junior users pick a behaviour instead of tuning
+# the eight raw knobs by hand. ``"default"`` matches the historical
+# defaults (``FilterThresholds()``) so preserving behaviour is just
+# selecting the default preset. ``"permissive"`` relaxes every threshold
+# so almost nothing is rejected (useful when the v1 heuristic over-rejects
+# on a new sensor); ``"strict"`` tightens them for clean acquisitions
+# where any doubt should drop the frame.
+# ---------------------------------------------------------------------------
+
+THRESHOLD_PRESETS: dict[str, FilterThresholds] = {
+    "permissive": FilterThresholds(
+        skew_max=0.10,
+        area_lo=0.25,
+        area_hi=4.0,
+        aspect_max=8.0,
+        centre_window=CENTRE_WINDOW,
+        min_valid_fraction=0.20,
+        std_min=0.001,
+        saturation_fraction=0.99,
+    ),
+    "default": FilterThresholds(),
+    "strict": FilterThresholds(
+        skew_max=0.02,
+        area_lo=0.75,
+        area_hi=1.5,
+        aspect_max=2.5,
+        centre_window=CENTRE_WINDOW,
+        min_valid_fraction=0.75,
+        std_min=0.01,
+        saturation_fraction=0.85,
+    ),
+}
+
+
+def preset_thresholds(name: str) -> FilterThresholds:
+    """Return the :class:`FilterThresholds` bundle for a preset name.
+
+    ``name`` is matched case-insensitively against
+    :data:`THRESHOLD_PRESETS` (``"permissive"`` / ``"default"`` /
+    ``"strict"``). Raises ``KeyError`` for any other name so callers
+    fail loudly instead of silently using the default.
+    """
+    key = name.strip().lower()
+    if key not in THRESHOLD_PRESETS:
+        raise KeyError(
+            "unknown threshold preset {!r}; expected one of {}".format(
+                name, sorted(THRESHOLD_PRESETS)))
+    return THRESHOLD_PRESETS[key]
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +209,7 @@ def filter_frames(
     paths: list[str],
     *,
     thresholds: FilterThresholds | None = None,
+    is_canceled: Optional[Callable[[], bool]] = None,
 ) -> tuple[list[str], list[tuple[str, str]]]:
     """Split ``paths`` into ``(good_paths, rejected)``.
 
@@ -162,12 +217,21 @@ def filter_frames(
     across all input frames is computed first and then passed to
     :func:`is_bad_frame` so that area outliers can be detected. Input
     order is preserved in both returned lists.
+
+    ``is_canceled`` is an optional zero-arg predicate consulted **between
+    frames** in both passes (Pipeline TO-DO #11 in
+    ``hyperspectral_plan.md``). When it returns ``True`` the function
+    aborts immediately by raising ``RuntimeError("canceled")`` so a
+    multi-minute Stage A run can be stopped cleanly from the QGIS dialog.
+    Default ``None`` keeps the previous uncancellable behaviour.
     """
     th = thresholds if thresholds is not None else FilterThresholds()
 
     # First pass: collect each frame's footprint area in CRS units squared.
     areas: list[float] = []
     for p in paths:
+        if is_canceled is not None and is_canceled():
+            raise RuntimeError("canceled")
         with rasterio.open(p) as src:
             t = src.transform
             areas.append(src.width * src.height * abs(t.a) * abs(t.e))
@@ -177,6 +241,8 @@ def filter_frames(
     good: list[str] = []
     rejected: list[tuple[str, str]] = []
     for p in paths:
+        if is_canceled is not None and is_canceled():
+            raise RuntimeError("canceled")
         bad, reason = is_bad_frame(
             p, median_area=median_area, thresholds=th)
         if bad:

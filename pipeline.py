@@ -14,6 +14,28 @@ is byte-equivalent to the historical in-pipeline loop);
 :class:`HyperspectralPipelineAlgorithm` swaps in
 :func:`fill_nodata.fill_nodata_file_gdal` (v3) when the user selects it
 from the dropdown.
+
+Temp-file convention
+--------------------
+
+:func:`run_pipeline` writes two intermediate artefacts next to the final
+``output_path`` and is responsible for removing them on every exit path
+(success, exception, ``KeyboardInterrupt``, QGIS cancellation):
+
+* ``<output>.mosaic.tif`` -- the Stage-B mosaic consumed by Stage C.
+  Created by :func:`mosaic.mosaic_frames`. Required hand-off (Stage C
+  reads it from disk), not merely a debug artefact.
+* ``<output>.fillmask.tif`` -- the interior-hole mask written by
+  :func:`fill_nodata.write_interior_fill_mask` when
+  ``fill_only_interior=True`` (default). Skipped when the caller opts
+  out.
+
+Both are wrapped in a single ``try / finally`` so they are always
+removed on the way out, even if the user cancels the run mid-Stage-B
+(``rasterio`` may have left a partial GeoTIFF behind) or hits Ctrl-C
+during gap-fill. The companion ``<output>.rejected.csv`` audit report
+written by Stage A is **not** a temp file -- it is a deliverable and
+stays on disk.
 """
 
 from __future__ import annotations
@@ -99,11 +121,24 @@ class _PipelineFeedback:
     those calls into the ``progress`` and ``log`` callbacks ``run_pipeline``
     already receives, mapping setProgress(0..100) into the [0.70 .. 1.00]
     fraction window reserved for Stage C.
+
+    ``is_canceled`` is an optional zero-arg predicate; when supplied it is
+    forwarded by :meth:`isCanceled` so the file-level gap-fill backends
+    (which already poll ``feedback.isCanceled`` between bands / tiles)
+    actually stop when the QGIS user clicks Cancel. Default ``None``
+    preserves the historical "never cancels" behaviour for non-QGIS
+    callers (Pipeline TO-DO #11 in ``hyperspectral_plan.md``).
     """
 
-    def __init__(self, progress: _ProgressCb, log: _LogCb) -> None:
+    def __init__(
+        self,
+        progress: _ProgressCb,
+        log: _LogCb,
+        is_canceled: Optional[Callable[[], bool]] = None,
+    ) -> None:
         self._progress = progress
         self._log = log
+        self._is_canceled = is_canceled
 
     def pushInfo(self, message: str) -> None:  # noqa: N802 (QGIS API name)
         self._log(message)
@@ -117,7 +152,9 @@ class _PipelineFeedback:
         self._progress(frac, "")
 
     def isCanceled(self) -> bool:  # noqa: N802
-        return False
+        if self._is_canceled is None:
+            return False
+        return bool(self._is_canceled())
 
 
 # Note: the interior-hole mask helper used to live here as
@@ -141,6 +178,7 @@ def run_pipeline(
     max_interior_gap_px: int = 0,
     tile_size: int = 0,
     n_workers: int = 1,
+    is_canceled: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """Run filter -> mosaic -> fill_nodata. Return a summary dict.
 
@@ -157,8 +195,13 @@ def run_pipeline(
         gap_fill_func = fill_nodata.fill_nodata_file
 
     # ---- Stage A: filter -------------------------------------------------
+    # ``is_canceled`` is forwarded into ``filter_frames`` so cancellation
+    # is honoured **between frames** (Pipeline TO-DO #11). Stage B's
+    # progress callback already raises on cancel via the QGIS-supplied
+    # ``progress`` shim, and Stage C polls ``feedback.isCanceled`` which
+    # we now bridge via ``_PipelineFeedback`` below.
     good, rejected = frame_filter.filter_frames(
-        input_paths, thresholds=thresholds)
+        input_paths, thresholds=thresholds, is_canceled=is_canceled)
     for p, reason in rejected:
         log_cb("REJECTED {}: {}".format(os.path.basename(p), reason))
     log_cb("Kept {} / {} frames".format(len(good), len(input_paths)))
@@ -183,21 +226,25 @@ def run_pipeline(
 
     # ---- Stage B: mosaic -------------------------------------------------
     # Place the temp mosaic next to the final output as
-    # ``<output>.mosaic.tif``. Simplest possible -- no tempfile bookkeeping,
-    # path is predictable for debugging, and it is removed at the end.
-    # Stage C consumes this file, so the on-disk intermediate is now a
+    # ``<output>.mosaic.tif`` (see the "Temp-file convention" section in
+    # this module's docstring). Path is predictable for debugging, and the
+    # ``try / finally`` below removes it on every exit path -- including
+    # ``KeyboardInterrupt`` and QGIS cancellation mid-mosaic, which is
+    # why the ``mosaic_frames`` call lives **inside** the ``try`` block
+    # (Pipeline TO-DO item in ``hyperspectral_plan.md``: "ensure cleanup
+    # on KeyboardInterrupt / cancellation, not only on success").
+    # Stage C consumes this file, so the on-disk intermediate is a
     # required hand-off rather than just a helpful artefact.
     mosaic_path = output_path + ".mosaic.tif"
-    mosaic.mosaic_frames(
-        good,
-        mosaic_path,
-        progress=lambda f, m: cb(0.05 + 0.65 * f, "mosaic: " + m),
-        reproject_to_first=reproject_to_first,
-    )
-
     band_count = 0
     fill_mask_path: Optional[str] = None
     try:
+        mosaic.mosaic_frames(
+            good,
+            mosaic_path,
+            progress=lambda f, m: cb(0.05 + 0.65 * f, "mosaic: " + m),
+            reproject_to_first=reproject_to_first,
+        )
         # All-NaN-band guard (Pipeline TO-DO item #4): scan the Stage-B
         # mosaic on disk before invoking the file-level gap-fill callable.
         # Either gap-fill backend (v2 pure-Python or v3 gdal.FillNodata)
@@ -237,7 +284,7 @@ def run_pipeline(
             mask_path=fill_mask_path,
             max_search_dist=float(max_distance),
             smoothing_iterations=int(smoothing_iterations),
-            feedback=_PipelineFeedback(cb, log_cb),
+            feedback=_PipelineFeedback(cb, log_cb, is_canceled),
             tile_size=int(tile_size),
             n_workers=int(n_workers),
         )

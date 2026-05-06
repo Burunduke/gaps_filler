@@ -6,6 +6,8 @@ gaps) as a single QGIS Processing algorithm so users can run it from
 the toolbox or in batch mode.
 """
 
+import os
+
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
@@ -18,7 +20,7 @@ from qgis.core import (
     QgsProcessingParameterRasterDestination,
 )
 
-from . import methods, mosaic, pipeline
+from . import canvas_styling, frame_filter, methods, mosaic, pipeline
 from .frame_filter import (
     AREA_HI,
     AREA_LO,
@@ -32,6 +34,26 @@ from .frame_filter import (
 )
 
 
+def _default_pipeline_output(input_paths):
+    """Derive ``<first_input_dir>/filled_mosaic.tif`` as default OUTPUT.
+
+    Pipeline TO-DO #14: when the user leaves OUTPUT empty, save the
+    filled mosaic next to the first input frame instead of forcing
+    them to type a path.
+    """
+    folder = os.path.dirname(os.path.abspath(input_paths[0]))
+    return os.path.join(folder, "filled_mosaic.tif")
+
+
+def _is_empty_output(raw):
+    """Return True when the user gave no real OUTPUT value."""
+    if raw is None:
+        return True
+    if isinstance(raw, str) and (not raw or raw == "TEMPORARY_OUTPUT"):
+        return True
+    return False
+
+
 class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
     """Filter bad PIKA-L frames, mosaic the survivors, then fill gaps."""
 
@@ -39,6 +61,7 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
     MAX_DISTANCE = "MAX_DISTANCE"
     SMOOTHING_ITERATIONS = "SMOOTHING_ITERATIONS"
     OUTPUT = "OUTPUT"
+    DRY_RUN = "DRY_RUN"
     REPROJECT_TO_FIRST = "REPROJECT_TO_FIRST"
     FILL_ONLY_INTERIOR = "FILL_ONLY_INTERIOR"
     MAX_INTERIOR_GAP_PX = "MAX_INTERIOR_GAP_PX"
@@ -48,6 +71,18 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
     FRAME_FILTER_METHOD = "FRAME_FILTER_METHOD"
     MOSAIC_METHOD = "MOSAIC_METHOD"
     GAP_FILL_METHOD = "GAP_FILL_METHOD"
+    THRESHOLD_PRESET = "THRESHOLD_PRESET"
+
+    # Mirrors FrameFilterAlgorithm.PRESET_CHOICES so a junior user can
+    # pick a named bundle of all eight thresholds (Pipeline TO-DO #13)
+    # instead of tuning each knob. Index 0 ("custom") keeps the raw
+    # threshold inputs as the source of truth -- backwards-compatible.
+    PRESET_CHOICES = [
+        ("custom", "Custom (use values below)"),
+        ("permissive", "Permissive"),
+        ("default", "Default"),
+        ("strict", "Strict"),
+    ]
 
     SKEW_MAX = "SKEW_MAX"
     AREA_LO = "AREA_LO"
@@ -149,6 +184,28 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        # Pipeline TO-DO #13: preset dropdown -- a non-"Custom" choice
+        # overrides the eight raw threshold inputs below with a named
+        # bundle. Default index 0 ("Custom") keeps the historical
+        # behaviour where the raw inputs are the source of truth.
+        preset_param = QgsProcessingParameterEnum(
+            self.THRESHOLD_PRESET,
+            self.tr("Threshold preset"),
+            options=[label for _, label in self.PRESET_CHOICES],
+            defaultValue=0,
+        )
+        preset_param.setHelp(self.tr(
+            "Pick a named bundle of all eight frame-filter thresholds "
+            "instead of tuning each one. 'Custom' uses the raw values "
+            "below (unchanged behaviour). 'Permissive' relaxes every "
+            "threshold (use when v1 over-rejects on a new sensor). "
+            "'Default' matches the documented PIKA-L defaults. "
+            "'Strict' tightens every threshold (clean acquisitions, "
+            "drop on any doubt). When a non-Custom preset is chosen "
+            "the raw threshold inputs below are ignored."
+        ))
+        self.addParameter(preset_param)
+
         self.addParameter(QgsProcessingParameterNumber(
             self.SKEW_MAX, self.tr("Max skew (rotation tolerance)"),
             type=Double, defaultValue=SKEW_MAX, minValue=0.0, maxValue=1.0))
@@ -185,6 +242,28 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             self.tr("Max saturated-pixel fraction in centre"),
             type=Double, defaultValue=SATURATION_FRACTION,
             minValue=0.0, maxValue=1.0))
+
+        # Pipeline TO-DO #18: dry-run mode. When ON, the algorithm runs
+        # only Stage A (frame filter) and reports kept / rejected counts
+        # per frame, skipping the expensive Stages B + C entirely. This
+        # turns iteration time when tuning thresholds from minutes into
+        # seconds. OFF (the default) preserves the full filter → mosaic
+        # → fill pipeline behaviour.
+        dry_param = QgsProcessingParameterBoolean(
+            self.DRY_RUN,
+            self.tr("Dry run (only Stage A; report kept / rejected, "
+                    "skip mosaic + fill)"),
+            defaultValue=False,
+        )
+        dry_param.setHelp(self.tr(
+            "When ON, only the frame filter (Stage A) runs. The mosaic "
+            "and gap-fill stages are skipped, no output raster is "
+            "written, and no layer is loaded into QGIS. Use this to "
+            "tune the filter thresholds quickly: the live log lists "
+            "every rejected frame with the violated threshold so you "
+            "know which knob to relax."
+        ))
+        self.addParameter(dry_param)
 
         self.addParameter(
             QgsProcessingParameterBoolean(
@@ -274,27 +353,71 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             parameters, self.MAX_DISTANCE, context)
         smoothing = self.parameterAsInt(
             parameters, self.SMOOTHING_ITERATIONS, context)
-        out_path = self.parameterAsOutputLayer(
-            parameters, self.OUTPUT, context)
+        # Pipeline TO-DO #18: dry-run flag. Read it early so we can
+        # skip output-path defaulting / post-processor wiring when no
+        # raster will actually be written.
+        dry_run = self.parameterAsBoolean(
+            parameters, self.DRY_RUN, context)
 
-        thresholds = FilterThresholds(
-            skew_max=self.parameterAsDouble(
-                parameters, self.SKEW_MAX, context),
-            area_lo=self.parameterAsDouble(
-                parameters, self.AREA_LO, context),
-            area_hi=self.parameterAsDouble(
-                parameters, self.AREA_HI, context),
-            aspect_max=self.parameterAsDouble(
-                parameters, self.ASPECT_MAX, context),
-            centre_window=self.parameterAsInt(
-                parameters, self.CENTRE_WINDOW, context),
-            min_valid_fraction=self.parameterAsDouble(
-                parameters, self.MIN_VALID_FRACTION, context),
-            std_min=self.parameterAsDouble(
-                parameters, self.STD_MIN, context),
-            saturation_fraction=self.parameterAsDouble(
-                parameters, self.SATURATION_FRACTION, context),
-        )
+        if dry_run:
+            # No raster output is produced in dry-run mode -- skip the
+            # default-output derivation (Pipeline TO-DO #14) and the
+            # RGB post-processor (Pipeline TO-DO #15) entirely.
+            out_path = ""
+        else:
+            # Pipeline TO-DO #14: derive a default output path from
+            # the first input frame's folder when OUTPUT is empty.
+            paths_preview = [lyr.source() for lyr in layers]
+            if _is_empty_output(parameters.get(self.OUTPUT)):
+                default = _default_pipeline_output(paths_preview)
+                parameters[self.OUTPUT] = default
+                feedback.pushInfo(
+                    "Output path empty; defaulting to {}".format(default))
+            out_path = self.parameterAsOutputLayer(
+                parameters, self.OUTPUT, context)
+
+            # Pipeline TO-DO #15: queue an RGB-composite post-processor
+            # so the auto-loaded filled mosaic shows a colour view
+            # instead of PIKA-L's near-black grayscale band 1. The
+            # output preserves the input band count, so the first
+            # input layer's band count is what the renderer should
+            # target.
+            if context.willLoadLayerOnCompletion(out_path):
+                details = context.layerToLoadOnCompletion(out_path)
+                self._rgb_post_processor = (
+                    canvas_styling.attach_rgb_post_processor(
+                        details, layers[0].bandCount()))
+
+        preset_idx = self.parameterAsEnum(
+            parameters, self.THRESHOLD_PRESET, context)
+        preset_id, preset_label = self.PRESET_CHOICES[preset_idx]
+        if preset_id == "custom":
+            thresholds = FilterThresholds(
+                skew_max=self.parameterAsDouble(
+                    parameters, self.SKEW_MAX, context),
+                area_lo=self.parameterAsDouble(
+                    parameters, self.AREA_LO, context),
+                area_hi=self.parameterAsDouble(
+                    parameters, self.AREA_HI, context),
+                aspect_max=self.parameterAsDouble(
+                    parameters, self.ASPECT_MAX, context),
+                centre_window=self.parameterAsInt(
+                    parameters, self.CENTRE_WINDOW, context),
+                min_valid_fraction=self.parameterAsDouble(
+                    parameters, self.MIN_VALID_FRACTION, context),
+                std_min=self.parameterAsDouble(
+                    parameters, self.STD_MIN, context),
+                saturation_fraction=self.parameterAsDouble(
+                    parameters, self.SATURATION_FRACTION, context),
+            )
+            feedback.pushInfo(
+                "Threshold preset: {} (using raw values below)".format(
+                    preset_label))
+        else:
+            thresholds = frame_filter.preset_thresholds(preset_id)
+            feedback.pushInfo(
+                "Threshold preset: {} (raw threshold inputs ignored)"
+                .format(preset_label))
 
         paths = [lyr.source() for lyr in layers]
 
@@ -331,6 +454,35 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
                 "frames whose CRS or pixel size differ from the first "
                 "frame will be reprojected during the mosaic stage.")
 
+        # Pipeline TO-DO #18: dry-run mode. Run only Stage A (frame
+        # filter) so the user can iterate on threshold tuning quickly.
+        # The mosaic and gap-fill stages are skipped entirely; no
+        # raster is written and no layer is loaded into QGIS.
+        if dry_run:
+            feedback.pushInfo(
+                "Dry run: only Stage A (frame filter) will run; "
+                "mosaic and fill stages are skipped.")
+            try:
+                kept_paths, rejected = frame_filter.filter_frames(
+                    paths,
+                    thresholds=thresholds,
+                    is_canceled=feedback.isCanceled,
+                )
+            except RuntimeError as exc:
+                if str(exc) == "canceled":
+                    raise QgsProcessingException(
+                        self.tr("Canceled by user"))
+                raise QgsProcessingException(str(exc))
+            for path, reason in rejected:
+                feedback.pushInfo(
+                    "rejected: {} -- {}".format(path, reason))
+            feedback.pushInfo(
+                "Dry run done: {} kept, {} rejected (of {} input "
+                "frame(s)).".format(
+                    len(kept_paths), len(rejected), len(paths)))
+            feedback.setProgress(100)
+            return {}
+
         # Resolve method selections via per-stage registries. The pipeline
         # orchestrator currently always uses the implemented v1/v1/v2 path;
         # the lookup here validates the user's choice and logs it, and is
@@ -355,6 +507,13 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
         mosaic_func = mos_entry["func"]
         gap_fill_func = gf_entry["func"]
 
+        # Granular progress (Pipeline TO-DO #12): forward the [0..1]
+        # ``fraction`` reported by ``pipeline.run_pipeline()`` straight
+        # into ``feedback.setProgress`` (which expects 0..100). The
+        # 0.05 / 0.65 / 0.30 split between Stages A / B / C is decided
+        # inside ``run_pipeline``; this shim is the only wiring needed.
+        # ``feedback.isCanceled()`` is also polled here so progress
+        # ticks double as cancellation checkpoints.
         def cb(fraction, message):
             if feedback.isCanceled():
                 raise QgsProcessingException(self.tr("Canceled by user"))
@@ -377,6 +536,10 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
                 max_interior_gap_px=int(max_interior_gap_px),
                 tile_size=int(tile_size),
                 n_workers=int(n_workers),
+                # Pipeline TO-DO #11: forward QGIS cancellation so Stage A
+                # checks between frames and Stage C's feedback shim returns
+                # the real cancel state instead of a hard-coded ``False``.
+                is_canceled=feedback.isCanceled,
             )
             # Stages A and B still use their single implemented version
             # internally; touch the resolved callables so static analysers
