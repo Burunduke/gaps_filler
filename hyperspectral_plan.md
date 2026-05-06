@@ -517,17 +517,17 @@ commercial-grade tool. Ordered roughly by ROI.
     2026-05-05).
   - [x] Bridge narrow / edge-touching gaps via morphological closing
     (`MAX_INTERIOR_GAP_PX`, default 50) — done 2026-05-05.
-- [ ] **Add mosaic v4 (feathered blending)** in
+- [x] **Add mosaic v4 (feathered blending)** in
   [`mosaic.py`](mosaic.py:1) as an opt-in `method="feather"` option in
   the new `MOSAIC_METHOD` dropdown. Adds `scipy` dep (already pulled by
-  `rasterio`'s extras).
-- [ ] **Add mosaic v5 (histogram match + feather)** behind the same
-  dropdown (default off — destroys spectra).
-- [ ] **Add filter v2 (per-flight adaptive thresholds)** in
+  `rasterio`'s extras). (done 2026-05-06)
+- [x] **Add mosaic v5 (histogram match + feather)** behind the same
+  dropdown (default off — destroys spectra). (done 2026-05-06)
+- [x] **Add filter v2 (per-flight adaptive thresholds)** in
   [`frame_filter.filter_frames()`](frame_filter.py:154) using
   median ± k·MAD on each metric. Expose `k` instead of all 8 thresholds
   in [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:22)
-  when the user picks `v2` from the filter dropdown.
-- [ ] **Add filter v3 (per-band striping / dropout check)** — extend
+  when the user picks `v2` from the filter dropdown. (done 2026-05-06)
+- [x] **Add filter v3 (per-band striping / dropout check)** — extend
   [`is_bad_frame()`](frame_filter.py:62) to read 3–5 representative
-  bands and check row-variance.
+  bands and check row-variance. (done 2026-05-06)

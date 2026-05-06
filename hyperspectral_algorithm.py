@@ -27,6 +27,8 @@ from .frame_filter import (
     ASPECT_MAX,
     CENTRE_WINDOW,
     FilterThresholds,
+    MAX_DROPOUT_FRAC,
+    MAX_STRIPE_RATIO,
     MIN_VALID_FRACTION,
     SATURATION_FRACTION,
     SKEW_MAX,
@@ -67,6 +69,10 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
     MAX_INTERIOR_GAP_PX = "MAX_INTERIOR_GAP_PX"
     TILE_SIZE = "TILE_SIZE"
     N_WORKERS = "N_WORKERS"
+    MAX_FEATHER_PX = "MAX_FEATHER_PX"
+    K_MAD = "K_MAD"
+    MAX_DROPOUT_FRAC = "MAX_DROPOUT_FRAC"
+    MAX_STRIPE_RATIO = "MAX_STRIPE_RATIO"
 
     FRAME_FILTER_METHOD = "FRAME_FILTER_METHOD"
     MOSAIC_METHOD = "MOSAIC_METHOD"
@@ -334,6 +340,74 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
         ))
         self.addParameter(workers_param)
 
+        feather_param = QgsProcessingParameterNumber(
+            self.MAX_FEATHER_PX,
+            self.tr("Max feather pixels (used by v4 and v5 mosaic methods)"),
+            type=Integer,
+            defaultValue=32,
+            minValue=0,
+        )
+        feather_param.setHelp(self.tr(
+            "Width (in pixels) of the distance-to-edge ramp used by the "
+            "v4 feathered mosaic method and reused by v5 (histogram "
+            "match + feather). Pixels deeper than this inside a frame "
+            "get full weight; closer to the edge they fade to zero, "
+            "which is what hides the seams. Ignored by v1. Default 32. "
+            "Warning: v5 alters per-pixel spectral values — use only "
+            "when visual continuity matters more than spectral accuracy."
+        ))
+        self.addParameter(feather_param)
+
+        # Roadmap item #2: only used when the user picks the v2 adaptive
+        # MAD filter method. Ignored by v1, so adding this parameter is
+        # backwards compatible.
+        kmad_param = QgsProcessingParameterNumber(
+            self.K_MAD,
+            self.tr("K_MAD (only used by v2 adaptive MAD filter)"),
+            type=Double,
+            defaultValue=3.0,
+            minValue=0.0,
+        )
+        kmad_param.setHelp(self.tr(
+            "Strictness of the v2 adaptive filter: a frame is rejected "
+            "when its footprint area deviates from the dataset median "
+            "by more than K_MAD * scaled-MAD (1.4826 * MAD). Larger "
+            "K_MAD = more permissive. Ignored by v1. Default 3.0."
+        ))
+        self.addParameter(kmad_param)
+
+        # Roadmap item #3: only used when the v3 per-band filter is
+        # picked. Defaults preserve old behaviour; ignored by v1 / v2.
+        dropout_param = QgsProcessingParameterNumber(
+            self.MAX_DROPOUT_FRAC,
+            self.tr("Max dropout fraction "
+                    "(only used by v3 per-band filter)"),
+            type=Double, defaultValue=MAX_DROPOUT_FRAC,
+            minValue=0.0, maxValue=1.0,
+        )
+        dropout_param.setHelp(self.tr(
+            "v3 per-band filter: a frame is rejected when any band has "
+            "more than this share of zero / saturated / NoData pixels "
+            "inside the valid footprint. Default 0.30. Ignored by "
+            "v1 / v2."
+        ))
+        self.addParameter(dropout_param)
+
+        stripe_param = QgsProcessingParameterNumber(
+            self.MAX_STRIPE_RATIO,
+            self.tr("Max stripe ratio "
+                    "(only used by v3 per-band filter)"),
+            type=Double, defaultValue=MAX_STRIPE_RATIO,
+            minValue=0.0,
+        )
+        stripe_param.setHelp(self.tr(
+            "v3 per-band filter: a frame is rejected when any band's "
+            "ratio of column-mean variance to overall variance exceeds "
+            "this value. Values closer to 1.0 mean more striping. "
+            "Default 0.5. Ignored by v1 / v2."
+        ))
+        self.addParameter(stripe_param)
+
         self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT, self.tr("Filled mosaic")
@@ -433,6 +507,14 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             parameters, self.TILE_SIZE, context)
         n_workers = self.parameterAsInt(
             parameters, self.N_WORKERS, context)
+        max_feather_px = self.parameterAsInt(
+            parameters, self.MAX_FEATHER_PX, context)
+        k_mad = self.parameterAsDouble(
+            parameters, self.K_MAD, context)
+        max_dropout_frac = self.parameterAsDouble(
+            parameters, self.MAX_DROPOUT_FRAC, context)
+        max_stripe_ratio = self.parameterAsDouble(
+            parameters, self.MAX_STRIPE_RATIO, context)
 
         # Validate inputs up-front so the user gets a clear error in
         # ~1 second on a CRS / pixel-size / band-count / dtype mismatch
@@ -533,6 +615,12 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
                 progress=cb,
                 log=feedback.pushInfo,
                 reproject_to_first=reproject_to_first,
+                filter_func=filter_func,
+                k_mad=float(k_mad),
+                max_dropout_frac=float(max_dropout_frac),
+                max_stripe_ratio=float(max_stripe_ratio),
+                mosaic_func=mosaic_func,
+                max_feather_pixels=int(max_feather_px),
                 gap_fill_func=gap_fill_func,
                 fill_only_interior=fill_only_interior,
                 max_interior_gap_px=int(max_interior_gap_px),
@@ -543,12 +631,6 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
                 # the real cancel state instead of a hard-coded ``False``.
                 is_canceled=feedback.isCanceled,
             )
-            # Stages A and B still use their single implemented version
-            # internally; touch the resolved callables so static analysers
-            # see they are part of the dispatch path. Drop these asserts
-            # when the pipeline learns to take filter/mosaic callables too.
-            assert callable(filter_func)
-            assert callable(mosaic_func)
         except QgsProcessingException:
             raise
         except RuntimeError as exc:

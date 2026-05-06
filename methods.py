@@ -39,6 +39,41 @@ FRAME_FILTER_METHODS = [
         ),
         "func": frame_filter.filter_frames,
     },
+    {
+        "id": "v2_adaptive_mad",
+        "label": "v2 — Adaptive MAD thresholds (per-flight)",
+        "tooltip": (
+            "Use when flights vary in altitude / lighting and a single "
+            "set of v1 hard thresholds over- or under-rejects across "
+            "runs. The per-frame footprint area is compared to the "
+            "dataset median; frames whose area deviates by more than "
+            "K_MAD * scaled-MAD (1.4826 * MAD ≈ σ for normal data) are "
+            "dropped (two-sided). The 'K_MAD' parameter (default 3.0) "
+            "controls strictness. "
+            "Limit: needs a flight with >~5 frames to estimate MAD "
+            "robustly. When MAD = 0 (all areas identical) the filter "
+            "keeps every frame."
+        ),
+        "func": frame_filter.filter_frames_adaptive_mad,
+    },
+    {
+        "id": "v3_per_band",
+        "label": "v3 — Per-band striping / dropout detection",
+        "tooltip": (
+            "Use to catch sensor row glitches and dead bands the v1 "
+            "centre-window heuristic misses. For every frame each band "
+            "is opened in turn and two simple signals are computed: "
+            "the dropout fraction (share of zero / saturated / NoData "
+            "pixels inside the valid footprint) and a striping "
+            "indicator (ratio of column-mean variance to overall "
+            "variance; values closer to 1.0 mean more striping). A "
+            "frame is dropped if ANY band exceeds 'Max dropout fraction' "
+            "(default 0.30) or 'Max stripe ratio' (default 0.5). "
+            "Limit: ~10× slower per frame than v1 because every band is "
+            "read; enable only when v1 / v2 leave obvious bad frames in."
+        ),
+        "func": frame_filter.filter_frames_per_band,
+    },
 ]
 
 
@@ -59,6 +94,39 @@ MOSAIC_METHODS = [
             "(best placement) or v4 (feathered)."
         ),
         "func": mosaic.mosaic_frames,
+    },
+    {
+        "id": "v4_feather",
+        "label": "v4 — Feathered / weighted blending",
+        "tooltip": (
+            "Use for commercial-grade visual deliverables — overlapping "
+            "frames are blended by distance-to-frame-edge so seams "
+            "disappear. The 'Max feather pixels' parameter controls the "
+            "ramp width (default 32). "
+            "Limit: spectra blur in overlap zones — not for strict "
+            "spectral analysis. Keep v1 selectable for the scientific "
+            "export path."
+        ),
+        "func": mosaic.mosaic_frames_feather,
+    },
+    {
+        "id": "v5_histmatch_feather",
+        "label": "v5 — Histogram match + feather (visual; alters spectra)",
+        "tooltip": (
+            "Visual-only refinement of v4. Before feathering, each "
+            "non-reference frame's bands are linearly rescaled "
+            "(mean/std moment matching) toward the reference frame so "
+            "brightness/contrast jumps between strips disappear; the "
+            "v4 feather blend then hides the residual seams. "
+            "Reference frame = the first input. The 'Max feather "
+            "pixels' parameter is shared with v4. "
+            "Warning: alters per-pixel spectral values. Use only when "
+            "visual continuity matters more than spectral accuracy — "
+            "do NOT use for classifiers, indices, or any downstream "
+            "spectral analysis. Keep v1 for the scientific export "
+            "path."
+        ),
+        "func": mosaic.mosaic_frames_histmatch_feather,
     },
 ]
 

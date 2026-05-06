@@ -28,6 +28,8 @@ from .frame_filter import (
     ASPECT_MAX,
     CENTRE_WINDOW,
     FilterThresholds,
+    MAX_DROPOUT_FRAC,
+    MAX_STRIPE_RATIO,
     MIN_VALID_FRACTION,
     SATURATION_FRACTION,
     SKEW_MAX,
@@ -46,6 +48,9 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
     REPORT = "REPORT"
     FRAME_FILTER_METHOD = "FRAME_FILTER_METHOD"
     THRESHOLD_PRESET = "THRESHOLD_PRESET"
+    K_MAD = "K_MAD"
+    MAX_DROPOUT_FRAC = "MAX_DROPOUT_FRAC"
+    MAX_STRIPE_RATIO = "MAX_STRIPE_RATIO"
 
     # Order matches the dropdown shown in QGIS. Index 0 keeps the
     # historical "use the eight raw inputs below" behaviour so existing
@@ -191,6 +196,55 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
             type=Double, defaultValue=SATURATION_FRACTION,
             minValue=0.0, maxValue=1.0))
 
+        # Roadmap item #2: only used when the user picks the v2 adaptive
+        # MAD filter method. Default 3.0 = drop frames whose footprint
+        # area is more than ~3 σ from the dataset median (assuming
+        # normal-ish spread; MAD is scaled by 1.4826 inside v2). Ignored
+        # by v1, so adding this parameter is backwards compatible.
+        kmad_param = QgsProcessingParameterNumber(
+            self.K_MAD,
+            self.tr("K_MAD (only used by v2 adaptive MAD filter)"),
+            type=Double, defaultValue=3.0, minValue=0.0)
+        kmad_param.setHelp(self.tr(
+            "Strictness of the v2 adaptive filter: a frame is rejected "
+            "when its footprint area deviates from the dataset median "
+            "by more than K_MAD * scaled-MAD (1.4826 * MAD). Larger "
+            "K_MAD = more permissive. Ignored by v1. Default 3.0."
+        ))
+        self.addParameter(kmad_param)
+
+        # Roadmap item #3: only used when the user picks the v3 per-band
+        # filter method. Defaults preserve the documented behaviour;
+        # ignored by v1 / v2, so adding these parameters is backwards
+        # compatible.
+        dropout_param = QgsProcessingParameterNumber(
+            self.MAX_DROPOUT_FRAC,
+            self.tr("Max dropout fraction "
+                    "(only used by v3 per-band filter)"),
+            type=Double, defaultValue=MAX_DROPOUT_FRAC,
+            minValue=0.0, maxValue=1.0)
+        dropout_param.setHelp(self.tr(
+            "v3 per-band filter: a frame is rejected when any band has "
+            "more than this share of zero / saturated / NoData pixels "
+            "inside the valid footprint. Default 0.30. Ignored by "
+            "v1 / v2."
+        ))
+        self.addParameter(dropout_param)
+
+        stripe_param = QgsProcessingParameterNumber(
+            self.MAX_STRIPE_RATIO,
+            self.tr("Max stripe ratio "
+                    "(only used by v3 per-band filter)"),
+            type=Double, defaultValue=MAX_STRIPE_RATIO,
+            minValue=0.0)
+        stripe_param.setHelp(self.tr(
+            "v3 per-band filter: a frame is rejected when any band's "
+            "ratio of column-mean variance to overall variance exceeds "
+            "this value. Values closer to 1.0 mean more striping. "
+            "Default 0.5. Ignored by v1 / v2."
+        ))
+        self.addParameter(stripe_param)
+
     # ---- Execution ---------------------------------------------------------
 
     def processAlgorithm(self, parameters, context, feedback):
@@ -244,13 +298,26 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(
             "Frame filter method: {}".format(method_entry["id"]))
 
+        # Build kwargs and only forward ``k_mad`` when v2 is selected,
+        # so the v1 dispatch path stays byte-equivalent to before.
+        method_kwargs = {
+            "thresholds": thresholds,
+            "is_canceled": feedback.isCanceled,
+        }
+        if method_entry["id"] == "v2_adaptive_mad":
+            method_kwargs["k_mad"] = self.parameterAsDouble(
+                parameters, self.K_MAD, context)
+        elif method_entry["id"] == "v3_per_band":
+            method_kwargs["max_dropout_frac"] = self.parameterAsDouble(
+                parameters, self.MAX_DROPOUT_FRAC, context)
+            method_kwargs["max_stripe_ratio"] = self.parameterAsDouble(
+                parameters, self.MAX_STRIPE_RATIO, context)
+
         try:
             # Pipeline TO-DO #11: forward QGIS cancellation so the filter
             # function checks ``feedback.isCanceled`` between frames in
             # both passes and aborts cleanly on user cancel.
-            good, rejected = method_entry["func"](
-                paths, thresholds=thresholds,
-                is_canceled=feedback.isCanceled)
+            good, rejected = method_entry["func"](paths, **method_kwargs)
         except RuntimeError as exc:
             if str(exc) == "canceled":
                 raise QgsProcessingException(self.tr("Canceled by user"))

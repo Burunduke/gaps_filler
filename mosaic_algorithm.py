@@ -15,6 +15,7 @@ from qgis.core import (
     QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
     QgsProcessingParameterMultipleLayers,
+    QgsProcessingParameterNumber,
     QgsProcessingParameterRasterDestination,
 )
 
@@ -48,6 +49,7 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
     OUTPUT = "OUTPUT"
     MOSAIC_METHOD = "MOSAIC_METHOD"
     REPROJECT_TO_FIRST = "REPROJECT_TO_FIRST"
+    MAX_FEATHER_PX = "MAX_FEATHER_PX"
 
     # ---- Algorithm metadata ------------------------------------------------
 
@@ -102,6 +104,24 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
                 defaultValue=False,
             )
         )
+        feather_param = QgsProcessingParameterNumber(
+            self.MAX_FEATHER_PX,
+            self.tr("Max feather pixels (used by v4 and v5 methods)"),
+            type=QgsProcessingParameterNumber.Integer,
+            defaultValue=32,
+            minValue=0,
+        )
+        feather_param.setHelp(self.tr(
+            "Width (in pixels) of the distance-to-edge ramp used by the "
+            "v4 feathered mosaic method and reused by v5 (histogram "
+            "match + feather). Pixels deeper than this inside a frame "
+            "get full weight; closer to the edge they fade to zero, "
+            "which is what hides the seams. Ignored by other methods. "
+            "Default 32. "
+            "Warning: v5 alters per-pixel spectral values — use only "
+            "when visual continuity matters more than spectral accuracy."
+        ))
+        self.addParameter(feather_param)
         self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT, self.tr("Mosaic output")
@@ -161,11 +181,25 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(
                 "Reprojection of mismatched frames is enabled.")
 
+        max_feather_px = self.parameterAsInt(
+            parameters, self.MAX_FEATHER_PX, context)
+
+        # Only the feather method consumes ``max_feather_pixels``; older
+        # methods take ``(paths, out_path, progress, reproject_to_first)``
+        # exactly as before, so we only pass the extra kwarg when it is
+        # meaningful. Keeps v1 byte-equivalent to its previous behaviour.
+        extra_kwargs = {}
+        if method_entry["id"] in ("v4_feather", "v5_histmatch_feather"):
+            extra_kwargs["max_feather_pixels"] = int(max_feather_px)
+            feedback.pushInfo(
+                "Feather ramp width: {} px".format(max_feather_px))
+
         try:
             method_entry["func"](
                 paths, out_path,
                 progress=cb,
                 reproject_to_first=reproject_to_first,
+                **extra_kwargs,
             )
         except QgsProcessingException:
             raise

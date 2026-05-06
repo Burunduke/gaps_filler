@@ -173,6 +173,12 @@ def run_pipeline(
     progress: Optional[_ProgressCb] = None,
     log: Optional[_LogCb] = None,
     reproject_to_first: bool = False,
+    filter_func: Optional[Callable[..., tuple]] = None,
+    k_mad: float = 3.0,
+    max_dropout_frac: float = frame_filter.MAX_DROPOUT_FRAC,
+    max_stripe_ratio: float = frame_filter.MAX_STRIPE_RATIO,
+    mosaic_func: Optional[Callable[..., str]] = None,
+    max_feather_pixels: int = 32,
     gap_fill_func: Optional[Callable[..., None]] = None,
     fill_only_interior: bool = True,
     max_interior_gap_px: int = 0,
@@ -193,6 +199,10 @@ def run_pipeline(
     log_cb: _LogCb = log if log is not None else _noop_log
     if gap_fill_func is None:
         gap_fill_func = fill_nodata.fill_nodata_file
+    if mosaic_func is None:
+        mosaic_func = mosaic.mosaic_frames
+    if filter_func is None:
+        filter_func = frame_filter.filter_frames
 
     # ---- Stage A: filter -------------------------------------------------
     # ``is_canceled`` is forwarded into ``filter_frames`` so cancellation
@@ -200,8 +210,19 @@ def run_pipeline(
     # progress callback already raises on cancel via the QGIS-supplied
     # ``progress`` shim, and Stage C polls ``feedback.isCanceled`` which
     # we now bridge via ``_PipelineFeedback`` below.
-    good, rejected = frame_filter.filter_frames(
-        input_paths, thresholds=thresholds, is_canceled=is_canceled)
+    # Only v2 (filter_frames_adaptive_mad) accepts ``k_mad``; v1 keeps
+    # its original signature, so we add the kwarg selectively to keep
+    # older methods byte-equivalent. Same pattern as ``max_feather_pixels``
+    # for mosaic v4.
+    filter_kwargs = {"thresholds": thresholds, "is_canceled": is_canceled}
+    if filter_func is frame_filter.filter_frames_adaptive_mad:
+        filter_kwargs["k_mad"] = float(k_mad)
+    elif filter_func is frame_filter.filter_frames_per_band:
+        # v3: forward the per-band knobs only on the v3 dispatch path so
+        # v1 / v2 calls stay byte-equivalent to before.
+        filter_kwargs["max_dropout_frac"] = float(max_dropout_frac)
+        filter_kwargs["max_stripe_ratio"] = float(max_stripe_ratio)
+    good, rejected = filter_func(input_paths, **filter_kwargs)
     for p, reason in rejected:
         log_cb("REJECTED {}: {}".format(os.path.basename(p), reason))
     log_cb("Kept {} / {} frames".format(len(good), len(input_paths)))
@@ -239,12 +260,20 @@ def run_pipeline(
     band_count = 0
     fill_mask_path: Optional[str] = None
     try:
-        mosaic.mosaic_frames(
-            good,
-            mosaic_path,
-            progress=lambda f, m: cb(0.05 + 0.65 * f, "mosaic: " + m),
-            reproject_to_first=reproject_to_first,
-        )
+        # Only v4 (mosaic_frames_feather) and v5
+        # (mosaic_frames_histmatch_feather) accept ``max_feather_pixels``;
+        # v1 retains its original signature, so we add the kwarg
+        # selectively to keep older methods byte-equivalent.
+        mosaic_kwargs = {
+            "progress": lambda f, m: cb(0.05 + 0.65 * f, "mosaic: " + m),
+            "reproject_to_first": reproject_to_first,
+        }
+        if mosaic_func in (
+            mosaic.mosaic_frames_feather,
+            mosaic.mosaic_frames_histmatch_feather,
+        ):
+            mosaic_kwargs["max_feather_pixels"] = int(max_feather_pixels)
+        mosaic_func(good, mosaic_path, **mosaic_kwargs)
         # All-NaN-band guard (Pipeline TO-DO item #4): scan the Stage-B
         # mosaic on disk before invoking the file-level gap-fill callable.
         # Either gap-fill backend (v2 pure-Python or v3 gdal.FillNodata)
