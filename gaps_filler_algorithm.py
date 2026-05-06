@@ -13,6 +13,7 @@ from qgis.core import (
     QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
+    QgsProcessingParameterDefinition,
     QgsProcessingParameterEnum,
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterDestination,
@@ -80,10 +81,11 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
 
     def shortHelpString(self):
         return self.tr(
-            "Fills NoData gaps in every band of a raster using a pure-Python "
-            "re-implementation of GDAL's FillNodata: inverse-distance "
-            "weighting from the four nearest valid pixels (one per spatial "
-            "quadrant), followed by an optional 3x3 smoothing pass.\n\n"
+            "Fills NoData gaps in every band of a raster. The actual "
+            "fill backend is picked from the 'Gap fill method' dropdown "
+            "(v2 — pure-Python IDW from the four nearest valid pixels "
+            "with optional 3x3 smoothing; v3 — native gdal.FillNodata "
+            "with v2 fallback).\n\n"
             "Inputs: any GDAL-readable raster, plus an optional validity "
             "mask (non-zero = valid). Output: a multi-band GeoTIFF with the "
             "same band count, geotransform, projection and per-band nodata "
@@ -176,6 +178,9 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
             "whole-band behaviour. The v3 backend (gdal.FillNodata) "
             "ignores this -- it streams in C already."
         ))
+        tile_param.setFlags(
+            tile_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
         self.addParameter(tile_param)
         workers_param = QgsProcessingParameterNumber(
             self.N_WORKERS,
@@ -192,6 +197,9 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
             "sequentially) and by the v3 backend (gdal.FillNodata is "
             "already a C routine)."
         ))
+        workers_param.setFlags(
+            workers_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
         self.addParameter(workers_param)
         self.addParameter(
             QgsProcessingParameterRasterDestination(

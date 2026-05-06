@@ -1,24 +1,31 @@
 # -*- coding: utf-8 -*-
-"""Pure-Python re-implementation of GDAL's GDALFillNodata.
+"""Stage C gap-fill backends (registered in :data:`methods.GAP_FILL_METHODS`).
 
 This module has **no Qt / QGIS dependencies**: it imports only ``numpy``
-(everywhere) and ``osgeo.gdal`` (lazily, in :func:`fill_nodata_file` for
-raster I/O). Anything UI-related lives in the algorithm/provider modules.
+(everywhere) and ``osgeo.gdal`` (lazily, for raster I/O). Anything
+UI-related lives in the algorithm/provider modules.
 
-Same observable behaviour as ``gdal.FillNodata``: per-pixel inverse-distance
-weighting from the four nearest originally-valid pixels (one per spatial
-quadrant — NW, NE, SW, SE) followed by an optional 3x3 masked-mean smoothing
-pass repeated N times.
+The active gap-fill method is selected at the call site via the
+``GAP_FILL_METHODS`` registry; this module ships two implementations:
 
-Phases:
-    1. forward (top-down) sweep   -> NW & NE candidates per pixel
-    2. backward (bottom-up) sweep -> SW & SE candidates per pixel
-    3. IDW combine                -> fill nodata pixels using 1/d^2 weights
-    4. smoothing                  -> N x 3x3 masked mean over filled pixels
+* :func:`fill_nodata_file` (v2, default) — pure-Python re-implementation
+  of GDAL's ``GDALFillNodata``: per-pixel inverse-distance weighting
+  from the four nearest originally-valid pixels (one per spatial
+  quadrant — NW, NE, SW, SE) followed by an optional 3x3 masked-mean
+  smoothing pass repeated N times. The array-level core
+  :func:`fill_nodata` is what implements those phases:
+      1. forward (top-down) sweep   -> NW & NE candidates per pixel
+      2. backward (bottom-up) sweep -> SW & SE candidates per pixel
+      3. IDW combine                -> fill nodata pixels using 1/d^2 weights
+      4. smoothing                  -> N x 3x3 masked mean over filled pixels
+* :func:`fill_nodata_file_gdal` (v3) — thin wrapper around the native-C
+  ``gdal.FillNodata`` for ~10–100× speed-ups, with an automatic fallback
+  to the v2 backend on any non-cancellation error.
 
 A ``feedback`` object (duck-typed :class:`QgsProcessingFeedback`) may be
 passed in to receive log lines and progress updates; cancellation is
-honoured at coarse boundaries (sweeps, smoothing iterations).
+honoured at coarse boundaries (sweeps, smoothing iterations, bands /
+tiles).
 """
 
 import numpy as np

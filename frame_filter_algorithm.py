@@ -13,6 +13,7 @@ from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
     QgsProcessingException,
+    QgsProcessingParameterDefinition,
     QgsProcessingParameterEnum,
     QgsProcessingParameterFileDestination,
     QgsProcessingParameterFolderDestination,
@@ -159,42 +160,74 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        self.addParameter(QgsProcessingParameterNumber(
+        skew_param = QgsProcessingParameterNumber(
             self.SKEW_MAX, self.tr("Max skew (rotation tolerance)"),
-            type=Double, defaultValue=SKEW_MAX, minValue=0.0, maxValue=1.0))
-        self.addParameter(QgsProcessingParameterNumber(
+            type=Double, defaultValue=SKEW_MAX, minValue=0.0, maxValue=1.0)
+        skew_param.setFlags(
+            skew_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(skew_param)
+        area_lo_param = QgsProcessingParameterNumber(
             self.AREA_LO,
             self.tr("Min area ratio vs. flight median"),
-            type=Double, defaultValue=AREA_LO, minValue=0.0, maxValue=1.0))
-        self.addParameter(QgsProcessingParameterNumber(
+            type=Double, defaultValue=AREA_LO, minValue=0.0, maxValue=1.0)
+        area_lo_param.setFlags(
+            area_lo_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(area_lo_param)
+        area_hi_param = QgsProcessingParameterNumber(
             self.AREA_HI,
             self.tr("Max area ratio vs. flight median"),
-            type=Double, defaultValue=AREA_HI, minValue=1.0, maxValue=10.0))
-        self.addParameter(QgsProcessingParameterNumber(
+            type=Double, defaultValue=AREA_HI, minValue=1.0, maxValue=10.0)
+        area_hi_param.setFlags(
+            area_hi_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(area_hi_param)
+        aspect_param = QgsProcessingParameterNumber(
             self.ASPECT_MAX,
             self.tr("Max aspect ratio (long / short side)"),
             type=Double, defaultValue=ASPECT_MAX,
-            minValue=1.0, maxValue=10.0))
-        self.addParameter(QgsProcessingParameterNumber(
+            minValue=1.0, maxValue=10.0)
+        aspect_param.setFlags(
+            aspect_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(aspect_param)
+        centre_param = QgsProcessingParameterNumber(
             self.CENTRE_WINDOW,
             self.tr("Centre window size (pixels)"),
             type=Integer, defaultValue=CENTRE_WINDOW,
-            minValue=4, maxValue=4096))
-        self.addParameter(QgsProcessingParameterNumber(
+            minValue=4, maxValue=4096)
+        centre_param.setFlags(
+            centre_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(centre_param)
+        min_valid_param = QgsProcessingParameterNumber(
             self.MIN_VALID_FRACTION,
             self.tr("Min fraction of valid pixels in centre"),
             type=Double, defaultValue=MIN_VALID_FRACTION,
-            minValue=0.0, maxValue=1.0))
-        self.addParameter(QgsProcessingParameterNumber(
+            minValue=0.0, maxValue=1.0)
+        min_valid_param.setFlags(
+            min_valid_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(min_valid_param)
+        std_min_param = QgsProcessingParameterNumber(
             self.STD_MIN,
             self.tr("Min std-dev of centre (low-variance reject)"),
             type=Double, defaultValue=STD_MIN,
-            minValue=0.0, maxValue=1e6))
-        self.addParameter(QgsProcessingParameterNumber(
+            minValue=0.0, maxValue=1e6)
+        std_min_param.setFlags(
+            std_min_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(std_min_param)
+        sat_param = QgsProcessingParameterNumber(
             self.SATURATION_FRACTION,
             self.tr("Max saturated-pixel fraction in centre"),
             type=Double, defaultValue=SATURATION_FRACTION,
-            minValue=0.0, maxValue=1.0))
+            minValue=0.0, maxValue=1.0)
+        sat_param.setFlags(
+            sat_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(sat_param)
 
         # Roadmap item #2: only used when the user picks the v2 adaptive
         # MAD filter method. Default 3.0 = drop frames whose footprint
@@ -211,6 +244,9 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
             "by more than K_MAD * scaled-MAD (1.4826 * MAD). Larger "
             "K_MAD = more permissive. Ignored by v1. Default 3.0."
         ))
+        kmad_param.setFlags(
+            kmad_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
         self.addParameter(kmad_param)
 
         # Roadmap item #3: only used when the user picks the v3 per-band
@@ -229,6 +265,9 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
             "inside the valid footprint. Default 0.30. Ignored by "
             "v1 / v2."
         ))
+        dropout_param.setFlags(
+            dropout_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
         self.addParameter(dropout_param)
 
         stripe_param = QgsProcessingParameterNumber(
@@ -243,6 +282,9 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
             "this value. Values closer to 1.0 mean more striping. "
             "Default 0.5. Ignored by v1 / v2."
         ))
+        stripe_param.setFlags(
+            stripe_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
         self.addParameter(stripe_param)
 
     # ---- Execution ---------------------------------------------------------

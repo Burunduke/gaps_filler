@@ -14,6 +14,7 @@ from qgis.core import (
     QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
+    QgsProcessingParameterDefinition,
     QgsProcessingParameterEnum,
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterNumber,
@@ -124,8 +125,11 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return self.tr(
             "End-to-end PIKA-L pipeline: rejects obviously-bad frames, "
-            "mosaics the survivors with first-write-wins overlap, and "
-            "fills NoData gaps in every band of the resulting mosaic."
+            "mosaics the survivors, and fills NoData gaps in every band "
+            "of the resulting mosaic. Per-stage behaviour is "
+            "method-dependent — pick a frame-filter / mosaic / gap-fill "
+            "method from the three dropdowns at the top of the dialog "
+            "(defaults reproduce the historical v1 / v1 / v2 path)."
         )
 
     # ---- Parameters --------------------------------------------------------
@@ -212,42 +216,74 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
         ))
         self.addParameter(preset_param)
 
-        self.addParameter(QgsProcessingParameterNumber(
+        skew_param = QgsProcessingParameterNumber(
             self.SKEW_MAX, self.tr("Max skew (rotation tolerance)"),
-            type=Double, defaultValue=SKEW_MAX, minValue=0.0, maxValue=1.0))
-        self.addParameter(QgsProcessingParameterNumber(
+            type=Double, defaultValue=SKEW_MAX, minValue=0.0, maxValue=1.0)
+        skew_param.setFlags(
+            skew_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(skew_param)
+        area_lo_param = QgsProcessingParameterNumber(
             self.AREA_LO,
             self.tr("Min area ratio vs. flight median"),
-            type=Double, defaultValue=AREA_LO, minValue=0.0, maxValue=1.0))
-        self.addParameter(QgsProcessingParameterNumber(
+            type=Double, defaultValue=AREA_LO, minValue=0.0, maxValue=1.0)
+        area_lo_param.setFlags(
+            area_lo_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(area_lo_param)
+        area_hi_param = QgsProcessingParameterNumber(
             self.AREA_HI,
             self.tr("Max area ratio vs. flight median"),
-            type=Double, defaultValue=AREA_HI, minValue=1.0, maxValue=10.0))
-        self.addParameter(QgsProcessingParameterNumber(
+            type=Double, defaultValue=AREA_HI, minValue=1.0, maxValue=10.0)
+        area_hi_param.setFlags(
+            area_hi_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(area_hi_param)
+        aspect_param = QgsProcessingParameterNumber(
             self.ASPECT_MAX,
             self.tr("Max aspect ratio (long / short side)"),
             type=Double, defaultValue=ASPECT_MAX,
-            minValue=1.0, maxValue=10.0))
-        self.addParameter(QgsProcessingParameterNumber(
+            minValue=1.0, maxValue=10.0)
+        aspect_param.setFlags(
+            aspect_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(aspect_param)
+        centre_param = QgsProcessingParameterNumber(
             self.CENTRE_WINDOW,
             self.tr("Centre window size (pixels)"),
             type=Integer, defaultValue=CENTRE_WINDOW,
-            minValue=4, maxValue=4096))
-        self.addParameter(QgsProcessingParameterNumber(
+            minValue=4, maxValue=4096)
+        centre_param.setFlags(
+            centre_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(centre_param)
+        min_valid_param = QgsProcessingParameterNumber(
             self.MIN_VALID_FRACTION,
             self.tr("Min fraction of valid pixels in centre"),
             type=Double, defaultValue=MIN_VALID_FRACTION,
-            minValue=0.0, maxValue=1.0))
-        self.addParameter(QgsProcessingParameterNumber(
+            minValue=0.0, maxValue=1.0)
+        min_valid_param.setFlags(
+            min_valid_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(min_valid_param)
+        std_min_param = QgsProcessingParameterNumber(
             self.STD_MIN,
             self.tr("Min std-dev of centre (low-variance reject)"),
             type=Double, defaultValue=STD_MIN,
-            minValue=0.0, maxValue=1e6))
-        self.addParameter(QgsProcessingParameterNumber(
+            minValue=0.0, maxValue=1e6)
+        std_min_param.setFlags(
+            std_min_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(std_min_param)
+        sat_param = QgsProcessingParameterNumber(
             self.SATURATION_FRACTION,
             self.tr("Max saturated-pixel fraction in centre"),
             type=Double, defaultValue=SATURATION_FRACTION,
-            minValue=0.0, maxValue=1.0))
+            minValue=0.0, maxValue=1.0)
+        sat_param.setFlags(
+            sat_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(sat_param)
 
         # Pipeline TO-DO #18: dry-run mode. When ON, the algorithm runs
         # only Stage A (frame filter) and reports kept / rejected counts
@@ -321,6 +357,9 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             "whole-band behaviour. The v3 backend (gdal.FillNodata) "
             "ignores this -- it streams in C already."
         ))
+        tile_param.setFlags(
+            tile_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
         self.addParameter(tile_param)
 
         workers_param = QgsProcessingParameterNumber(
@@ -338,6 +377,9 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             "sequentially) and by the v3 backend (gdal.FillNodata is "
             "already a C routine)."
         ))
+        workers_param.setFlags(
+            workers_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
         self.addParameter(workers_param)
 
         feather_param = QgsProcessingParameterNumber(
@@ -356,6 +398,9 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             "Warning: v5 alters per-pixel spectral values — use only "
             "when visual continuity matters more than spectral accuracy."
         ))
+        feather_param.setFlags(
+            feather_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
         self.addParameter(feather_param)
 
         # Roadmap item #2: only used when the user picks the v2 adaptive
@@ -374,6 +419,9 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             "by more than K_MAD * scaled-MAD (1.4826 * MAD). Larger "
             "K_MAD = more permissive. Ignored by v1. Default 3.0."
         ))
+        kmad_param.setFlags(
+            kmad_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
         self.addParameter(kmad_param)
 
         # Roadmap item #3: only used when the v3 per-band filter is
@@ -391,6 +439,9 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             "inside the valid footprint. Default 0.30. Ignored by "
             "v1 / v2."
         ))
+        dropout_param.setFlags(
+            dropout_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
         self.addParameter(dropout_param)
 
         stripe_param = QgsProcessingParameterNumber(
@@ -406,6 +457,9 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             "this value. Values closer to 1.0 mean more striping. "
             "Default 0.5. Ignored by v1 / v2."
         ))
+        stripe_param.setFlags(
+            stripe_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
         self.addParameter(stripe_param)
 
         self.addParameter(
@@ -546,12 +600,29 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(
                 "Dry run: only Stage A (frame filter) will run; "
                 "mosaic and fill stages are skipped.")
+            # Dispatch through the FRAME_FILTER_METHODS registry so the
+            # dry-run path honours the user's method selection (and stays
+            # in lockstep with the non-dry-run path below). Mirror the
+            # conditional v2 (``k_mad``) / v3 (``max_dropout_frac``,
+            # ``max_stripe_ratio``) kwarg-building logic from
+            # ``pipeline.run_pipeline`` so the two paths cannot drift.
+            ff_idx = self.parameterAsEnum(
+                parameters, self.FRAME_FILTER_METHOD, context)
+            ff_entry = methods.FRAME_FILTER_METHODS[ff_idx]
+            feedback.pushInfo(
+                "Filter method: {}".format(ff_entry["id"]))
+            filter_func = ff_entry["func"]
+            filter_kwargs = {
+                "thresholds": thresholds,
+                "is_canceled": feedback.isCanceled,
+            }
+            if filter_func is frame_filter.filter_frames_adaptive_mad:
+                filter_kwargs["k_mad"] = float(k_mad)
+            elif filter_func is frame_filter.filter_frames_per_band:
+                filter_kwargs["max_dropout_frac"] = float(max_dropout_frac)
+                filter_kwargs["max_stripe_ratio"] = float(max_stripe_ratio)
             try:
-                kept_paths, rejected = frame_filter.filter_frames(
-                    paths,
-                    thresholds=thresholds,
-                    is_canceled=feedback.isCanceled,
-                )
+                kept_paths, rejected = filter_func(paths, **filter_kwargs)
             except RuntimeError as exc:
                 if str(exc) == "canceled":
                     raise QgsProcessingException(
@@ -567,10 +638,10 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             feedback.setProgress(100)
             return {}
 
-        # Resolve method selections via per-stage registries. The pipeline
-        # orchestrator currently always uses the implemented v1/v1/v2 path;
-        # the lookup here validates the user's choice and logs it, and is
-        # the wiring point future versions will hook into without UI churn.
+        # Resolve method selections via per-stage registries; each entry's
+        # callable is forwarded into ``pipeline.run_pipeline`` below, so
+        # the user's choice in each dropdown is what actually drives the
+        # corresponding stage (defaults map to the v1 / v1 / v2 path).
         ff_idx = self.parameterAsEnum(
             parameters, self.FRAME_FILTER_METHOD, context)
         mos_idx = self.parameterAsEnum(

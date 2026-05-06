@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """Processing algorithm wrapper around :mod:`mosaic`.
 
-Exposes Stage B of the hyperspectral pipeline (first-write-wins mosaic of
-already-filtered frames) as a standalone QGIS Processing algorithm.
+Exposes Stage B of the hyperspectral pipeline (mosaic of already-filtered
+frames) as a standalone QGIS Processing algorithm. The actual blending
+strategy for overlapping pixels is picked from the ``Mosaic method``
+dropdown (registered in :data:`methods.MOSAIC_METHODS` — currently
+``v1`` first-write-wins, ``v4`` feather, ``v5`` histmatch + feather);
+the algorithm's display name keeps the original ``first-write-wins``
+wording for backwards compatibility with saved Model Builder graphs.
 """
 
 import os
@@ -13,6 +18,7 @@ from qgis.core import (
     QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
+    QgsProcessingParameterDefinition,
     QgsProcessingParameterEnum,
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterNumber,
@@ -121,6 +127,9 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
             "Warning: v5 alters per-pixel spectral values — use only "
             "when visual continuity matters more than spectral accuracy."
         ))
+        feather_param.setFlags(
+            feather_param.flags()
+            | QgsProcessingParameterDefinition.FlagAdvanced)
         self.addParameter(feather_param)
         self.addParameter(
             QgsProcessingParameterRasterDestination(

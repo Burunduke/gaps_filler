@@ -1,16 +1,20 @@
 # -*- coding: utf-8 -*-
-"""Stage B of the hyperspectral pipeline (see ``hyperspectral_plan.md``).
+"""Stage B of the hyperspectral pipeline.
 
 Mosaic a list of already-filtered, georeferenced PIKA-L GeoTIFF frames
 into a single tiled BigTIFF, processed band-by-band to keep memory
-bounded. Overlapping pixels follow first-write-wins
-(``method="first"`` in :func:`rasterio.merge.merge`). Output is
-``float32`` with ``NaN`` as NoData.
+bounded. Output is ``float32`` with ``NaN`` as NoData. The strategy
+used for overlapping pixels is **method-dependent**: the active
+mosaic method is selected at the call site via
+:data:`methods.MOSAIC_METHODS` (e.g. ``v1`` first-write-wins,
+``v4`` distance-weighted feather, ``v5`` histogram match + feather).
 
-Public API:
+Public API (one entry per registered method, plus shared helpers):
     * :class:`MosaicInputError` — raised on incompatible inputs.
     * :func:`validate_inputs` — cross-frame compatibility check.
-    * :func:`mosaic_frames` — band-streaming mosaic writer.
+    * :func:`mosaic_frames` — v1 first-write-wins band-streaming writer.
+    * :func:`mosaic_frames_feather` — v4 feathered / weighted blend.
+    * :func:`mosaic_frames_histmatch_feather` — v5 histmatch + feather.
 
 Dependencies are limited to ``rasterio``, ``numpy`` and the Python
 stdlib; in particular this module must not import ``osgeo.gdal`` or

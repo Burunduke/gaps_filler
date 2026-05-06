@@ -197,12 +197,20 @@ def run_pipeline(
     """
     cb: _ProgressCb = progress if progress is not None else _noop
     log_cb: _LogCb = log if log is not None else _noop_log
-    if gap_fill_func is None:
-        gap_fill_func = fill_nodata.fill_nodata_file
-    if mosaic_func is None:
-        mosaic_func = mosaic.mosaic_frames
+    # Resolve method defaults via the registry so adding/reordering
+    # methods in ``methods.py`` cannot silently desync the pipeline
+    # default. Index 0 of each registry is the production default and
+    # is byte-equivalent to the previous hard-coded fallbacks
+    # (``frame_filter.filter_frames`` / ``mosaic.mosaic_frames`` /
+    # ``fill_nodata.fill_nodata_file``). Imported lazily to avoid any
+    # potential top-level circular-import surprise.
+    from . import methods
     if filter_func is None:
-        filter_func = frame_filter.filter_frames
+        filter_func = methods.FRAME_FILTER_METHODS[0]["func"]
+    if mosaic_func is None:
+        mosaic_func = methods.MOSAIC_METHODS[0]["func"]
+    if gap_fill_func is None:
+        gap_fill_func = methods.GAP_FILL_METHODS[0]["func"]
 
     # ---- Stage A: filter -------------------------------------------------
     # ``is_canceled`` is forwarded into ``filter_frames`` so cancellation

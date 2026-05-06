@@ -162,3 +162,33 @@ Legend: RMSE / MAE — lower is better; PSNR / SSIM — higher is better.
 - Band 38 owns both `WORST_RMSE` and `WORST_MAE`: highest absolute error, likely a bright channel with steep gradients near gap edges where any interpolation slip translates into large pixel-space residuals.
 - Band 202 has `WORST_PSNR ≈ 28 dB` at only moderate RMSE → low-MAX band (dark / SWIR or H₂O absorption region, low SNR), so PSNR is dominated by the small dynamic range rather than reconstruction error.
 - Band 138 has `WORST_SSIM` at moderate pixel error → structural artefacts (likely visible mosaic seams / texture discontinuities) that pixel-wise metrics under-weight.
+
+## Changelog — 2026-05-06 plan retirement
+
+`hyperspectral_plan.md` has been fully completed and removed from the repository. All committed items in its three stages and the cross-cutting Pipeline TO-DO list shipped and are documented in the dated entries above; remaining `_planned_` markers in the plan were explicit non-commitments and are intentionally not carried forward.
+
+Delivered across the three stages:
+- **Stage A — Frame filter:** `v1_hard_thresholds` (default), `v2_adaptive_mad` (per-flight MAD around the median footprint area), `v3_per_band` (per-band striping ratio + dropout fraction).
+- **Stage B — Mosaic:** `v1_first_write_wins` (default), `v4_feather` (distance-transform-weighted blending), `v5_histmatch_feather` (linear mean/std match against the first frame, then v4 — visual-only; alters spectra).
+- **Stage C — Gap-fill:** `v2_idw_quadrants` (default, pure-Python) and `v3_gdal_fillnodata` (native C with v2 fallback).
+
+Cross-cutting Pipeline TO-DO closed: method-selection UX (per-stage [`methods.py`](methods.py:1) registries with tooltip dispatch), robustness (early `validate_inputs`, all-NaN-band guard, optional CRS reprojection, FD-cap chunked merge, rejected-frames CSV, cancellation), performance (frame-open inversion, GDAL gap-fill backend, windowed/tiled fill, parallel per-band threads), QGIS UX (threshold presets, default OUTPUT paths, granular progress, RGB post-processor, dry-run, resolved metadata URLs, documented `rasterio >= 1.3`), maintenance (temp-file convention `<output>.mosaic.tif` / `<output>.fillmask.tif` inside `try/finally`), and footprint-aware gap-fill (interior-hole topology + `MAX_INTERIOR_GAP_PX` morphological closing).
+
+## Changelog — 2026-05-06 multi-method consistency sweep
+
+Follow-up cleanup after the three method registries shipped: every place that still implicitly assumed a single fixed method per stage has been wired through the registry, and the Stage A / B / C parameter dialogs were tidied so only the relevant knobs are visible by default. No behavioural change for users who keep all three dropdowns on their default (index 0); v2 / v3 / v4 / v5 paths only get touched when the user picks them.
+
+**Dispatch correctness.**
+- [`pipeline.run_pipeline()`](pipeline.py:166) now defaults its three method funcs from `methods.FRAME_FILTER_METHODS[0]["func"]` / `methods.MOSAIC_METHODS[0]["func"]` / `methods.GAP_FILL_METHODS[0]["func"]` (lazy `from . import methods` to avoid any top-level circular-import surprise) instead of the hard-coded `frame_filter.filter_frames` / `mosaic.mosaic_frames` / `fill_nodata.fill_nodata_file` fallbacks. Reordering or replacing the index-0 entry in [`methods.py`](methods.py:1) now propagates without touching the orchestrator. Behaviour is byte-identical for v1 / default users (the registry's index 0 is still those same three callables).
+
+**Dry-run consistency.**
+- [`HyperspectralPipelineAlgorithm.processAlgorithm()`](hyperspectral_algorithm.py:596) dry-run path now reads `FRAME_FILTER_METHOD` and dispatches through `methods.FRAME_FILTER_METHODS[idx]["func"]` (was hard-coded to v1 [`frame_filter.filter_frames()`](frame_filter.py:214)). The conditional kwarg-building (forward `k_mad` only for v2; `max_dropout_frac` / `max_stripe_ratio` only for v3) mirrors [`pipeline.run_pipeline()`](pipeline.py:225) line-for-line so the v2 / v3 dry-run paths cannot drift from the non-dry-run path.
+
+**Dialog UX — `FlagAdvanced` on method-specific knobs.**
+- The 8 raw v1 thresholds (`SKEW_MAX`, `AREA_LO`, `AREA_HI`, `ASPECT_MAX`, `CENTRE_WINDOW`, `MIN_VALID_FRACTION`, `STD_MIN`, `SATURATION_FRACTION`), the v2 `K_MAD`, and the v3 `MAX_DROPOUT_FRAC` / `MAX_STRIPE_RATIO` are now flagged `QgsProcessingParameterDefinition.FlagAdvanced` in [`FrameFilterAlgorithm`](frame_filter_algorithm.py:104) and [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:216) — the threshold preset / method dropdowns stay on top, the raw knobs live under "Advanced parameters".
+- `MAX_FEATHER_PX` (used only by mosaic v4 / v5) flagged `FlagAdvanced` in [`MosaicAlgorithm`](mosaic_algorithm.py:108) and [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:382).
+- `TILE_SIZE` and `N_WORKERS` (Stage C performance knobs, ignored by v3) flagged `FlagAdvanced` in [`FillNoDataAlgorithm`](gaps_filler_algorithm.py:164) and [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:341).
+- Defaults / parameter IDs / descriptions / declaration order are unchanged — only the flag was OR'd in. Cleaner dialog: only the relevant knobs are visible by default; the rest live one click away.
+
+**Terminology sweep.**
+- Module / class docstrings, comments and a couple of `shortHelpString` strings reworded where they implied a single fixed method per stage. Touched: [`pipeline.py`](pipeline.py:1) (already accurate, left as-is), [`frame_filter.py`](frame_filter.py:2) module docstring (Public API now lists v1 / v2 / v3 batch wrappers; rejection heuristic flagged as method-dependent), [`mosaic.py`](mosaic.py:2) module docstring (overlap strategy is method-dependent — v1 / v4 / v5 — Public API lists all three callables), [`fill_nodata.py`](fill_nodata.py:2) module docstring (now describes both v2 IDW and v3 gdal.FillNodata as registered backends instead of claiming the module *is* a pure-Python re-implementation), [`mosaic_algorithm.py`](mosaic_algorithm.py:2) module docstring (notes that the display name keeps its historical `first-write-wins` wording for Model Builder backwards compat), [`gaps_filler_algorithm.py`](gaps_filler_algorithm.py:82) `shortHelpString` (mentions both v2 / v3 backends), [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py:125) `shortHelpString` + the stale "currently always uses the implemented v1/v1/v2 path" comment near [`processAlgorithm`](hyperspectral_algorithm.py:638). `QgsProcessingAlgorithm.name()` / `displayName()` / `groupId()` / parameter descriptions were intentionally left untouched (saved Model Builder graphs reference them by string).

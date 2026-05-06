@@ -1,16 +1,25 @@
 # -*- coding: utf-8 -*-
-"""Stage A of the hyperspectral pipeline (see ``hyperspectral_plan.md``).
+"""Stage A of the hyperspectral pipeline.
 
 Reject obviously-bad PIKA-L frames before mosaicking. Each frame is a
 georeferenced GeoTIFF; NoData is taken from ``src.nodata``. All frames are
 assumed to share CRS and pixel size — that invariant is checked in Stage B,
 not here.
 
-Public API:
-    * :class:`FilterThresholds` — bundle of tunable thresholds.
-    * :func:`is_bad_frame` — single-frame heuristic check.
-    * :func:`filter_frames` — batch wrapper that derives the median
+The actual rejection heuristic is **method-dependent**: the active
+filter method is selected at the call site via
+:data:`methods.FRAME_FILTER_METHODS` (e.g. ``v1`` hard thresholds,
+``v2`` per-flight adaptive MAD, ``v3`` per-band striping / dropout).
+
+Public API (one batch entry per registered method, plus shared helpers):
+    * :class:`FilterThresholds` — bundle of tunable thresholds (v1).
+    * :func:`is_bad_frame` — single-frame v1 heuristic check.
+    * :func:`filter_frames` — v1 batch wrapper that derives the median
       footprint area and dispatches to :func:`is_bad_frame`.
+    * :func:`filter_frames_adaptive_mad` — v2 batch wrapper (per-flight
+      MAD around the median footprint area).
+    * :func:`filter_frames_per_band` — v3 batch wrapper (per-band
+      striping ratio + dropout fraction).
 
 Dependencies are limited to ``rasterio``, ``numpy`` and the Python stdlib;
 in particular this module must not import ``osgeo.gdal`` or ``qgis``.
