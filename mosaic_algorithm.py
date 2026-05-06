@@ -135,10 +135,12 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
         # mosaic preserves the input band count, so we read it from
         # the first input layer.
         if context.willLoadLayerOnCompletion(out_path):
-            details = context.layerToLoadOnCompletion(out_path)
-            self._rgb_post_processor = (
-                canvas_styling.attach_rgb_post_processor(
-                    details, layers[0].bandCount()))
+            pending = context.layersToLoadOnCompletion()
+            details = pending.get(out_path)
+            if details is not None:
+                self._rgb_post_processor = (
+                    canvas_styling.attach_rgb_post_processor(
+                        details, layers[0].bandCount()))
 
         def cb(fraction, message):
             if feedback.isCanceled():

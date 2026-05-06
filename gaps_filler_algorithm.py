@@ -227,10 +227,12 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
         # the canvas, swap the default grayscale-band-1 renderer for an
         # RGB composite picked from the input cube's band count.
         if context.willLoadLayerOnCompletion(out_path):
-            details = context.layerToLoadOnCompletion(out_path)
-            self._rgb_post_processor = (
-                canvas_styling.attach_rgb_post_processor(
-                    details, src_layer.bandCount()))
+            pending = context.layersToLoadOnCompletion()
+            details = pending.get(out_path)
+            if details is not None:
+                self._rgb_post_processor = (
+                    canvas_styling.attach_rgb_post_processor(
+                        details, src_layer.bandCount()))
         fill_only_interior = self.parameterAsBoolean(
             parameters, self.FILL_ONLY_INTERIOR, context)
         max_interior_gap_px = self.parameterAsInt(
