@@ -112,7 +112,7 @@ class AirborneGeorefAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterFile(
                 self.HDR,
                 self.tr("ENVI header (.hdr) - auto-discovered if omitted"),
-                fileType=QgsProcessingParameterFile.File,
+                behavior=QgsProcessingParameterFile.File,
                 optional=True
             )
         )
@@ -121,7 +121,7 @@ class AirborneGeorefAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterFile(
                 self.TIMES,
                 self.tr(".times file (per-frame timestamps) - auto-discovered if omitted"),
-                fileType=QgsProcessingParameterFile.File,
+                behavior=QgsProcessingParameterFile.File,
                 optional=True
             )
         )
@@ -130,7 +130,7 @@ class AirborneGeorefAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterFile(
                 self.LCF,
                 self.tr(".lcf file (navigation log) - auto-discovered if omitted"),
-                fileType=QgsProcessingParameterFile.File,
+                behavior=QgsProcessingParameterFile.File,
                 optional=True
             )
         )
