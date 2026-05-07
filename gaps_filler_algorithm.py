@@ -21,7 +21,7 @@ from qgis.core import (
 )
 
 from .src import fill_nodata, methods
-from . import canvas_styling
+from . import canvas_styling, qgis_helpers
 
 
 def _default_output_path(input_path, suffix):
@@ -235,13 +235,8 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
         # Pipeline TO-DO #15: when QGIS will auto-load the result onto
         # the canvas, swap the default grayscale-band-1 renderer for an
         # RGB composite picked from the input cube's band count.
-        if context.willLoadLayerOnCompletion(out_path):
-            pending = context.layersToLoadOnCompletion()
-            details = pending.get(out_path)
-            if details is not None:
-                self._rgb_post_processor = (
-                    canvas_styling.attach_rgb_post_processor(
-                        details, src_layer.bandCount()))
+        self._rgb_post_processor = canvas_styling.attach_rgb_post_processor_if_needed(
+            context, out_path, src_layer.bandCount())
         fill_only_interior = self.parameterAsBoolean(
             parameters, self.FILL_ONLY_INTERIOR, context)
         max_interior_gap_px = self.parameterAsInt(
@@ -309,14 +304,8 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
                         feedback.pushInfo("  largest_gap_area_m2: {:.2f}".format(gap_metrics["largest_gap_area_m2"]))
                 except Exception as e:
                     feedback.pushInfo("Warning: Failed to compute gap region metrics: {}".format(str(e)))
-        except RuntimeError as exc:
-            # fill_nodata raises RuntimeError("canceled") when feedback
-            # reports cancellation. Translate to a clean Processing error.
-            if str(exc) == "canceled":
-                raise QgsProcessingException(self.tr("Canceled by user"))
-            raise QgsProcessingException(str(exc))
         except Exception as exc:
-            raise QgsProcessingException(str(exc))
+            qgis_helpers.handle_processing_exception(exc)
         finally:
             # Best-effort cleanup of the auto-generated mask (only the one
             # we created -- never the user-supplied one).

@@ -23,7 +23,7 @@ from qgis.core import (
 )
 
 from .src import airborne_georef, models
-from . import canvas_styling
+from . import canvas_styling, qgis_helpers
 
 
 def _is_empty_output(raw):
@@ -404,12 +404,8 @@ class AirborneGeorefAlgorithm(QgsProcessingAlgorithm):
                 time_offset_s=time_offset_s,
                 footprint_path=footprint_path
             )
-        except RuntimeError as exc:
-            if str(exc) == "canceled":
-                raise QgsProcessingException(self.tr("Canceled by user"))
-            raise QgsProcessingException(str(exc))
         except Exception as exc:
-            raise QgsProcessingException(str(exc))
+            qgis_helpers.handle_processing_exception(exc)
         
         feedback.pushInfo(
             "Georeferenced GeoTIFF written: {}".format(result.output_path))
@@ -420,14 +416,9 @@ class AirborneGeorefAlgorithm(QgsProcessingAlgorithm):
             "Output CRS: {}".format(result.crs))
         
         # Attach RGB post-processor for better visualization
-        if context.willLoadLayerOnCompletion(out_path):
-            pending = context.layersToLoadOnCompletion()
-            details = pending.get(out_path)
-            if details is not None:
-                # Try to get band count from the result or default to a reasonable value
-                band_count = getattr(result, 'bands', 280)  # PIKA-L typical band count
-                self._rgb_post_processor = (
-                    canvas_styling.attach_rgb_post_processor(
-                        details, band_count))
+        # Try to get band count from the result or default to a reasonable value
+        band_count = getattr(result, 'bands', models.DEFAULT_PIKA_L_BANDS)  # PIKA-L typical band count
+        self._rgb_post_processor = canvas_styling.attach_rgb_post_processor_if_needed(
+            context, out_path, band_count)
         
         return {self.OUTPUT: out_path}

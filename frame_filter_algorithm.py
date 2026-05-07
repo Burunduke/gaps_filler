@@ -22,6 +22,7 @@ from qgis.core import (
 )
 
 from .src import frame_filter, methods
+from . import qgis_helpers
 from .src.frame_filter import (
     AREA_HI,
     AREA_LO,
@@ -362,12 +363,8 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
             # function checks ``feedback.isCanceled`` between frames in
             # both passes and aborts cleanly on user cancel.
             good, rejected = method_entry["func"](paths, **method_kwargs)
-        except RuntimeError as exc:
-            if str(exc) == "canceled":
-                raise QgsProcessingException(self.tr("Canceled by user"))
-            raise QgsProcessingException(str(exc))
         except Exception as exc:
-            raise QgsProcessingException(str(exc))
+            qgis_helpers.handle_processing_exception(exc)
 
         # Log every rejected frame so the user sees WHY each was dropped.
         for i, (p, reason) in enumerate(rejected):

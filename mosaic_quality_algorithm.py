@@ -212,6 +212,20 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
         # We won't add nodata_fraction_per_band as an output since it's a list
         # We also won't add the filled_only and overlap_only metrics as outputs
         # to keep the interface simple, but they're available in the detailed report
+        
+        # Seam consistency metrics
+        self.addOutput(QgsProcessingOutputNumber(
+            "SEAM_MEAN_ABS_DIFF", self.tr("Seam mean absolute spectral difference")))
+        self.addOutput(QgsProcessingOutputNumber(
+            "SEAM_MEDIAN_ABS_DIFF", self.tr("Seam median absolute spectral difference")))
+        self.addOutput(QgsProcessingOutputNumber(
+            "SEAM_P95_ABS_DIFF", self.tr("Seam 95th percentile absolute spectral difference")))
+        self.addOutput(QgsProcessingOutputNumber(
+            "SEAM_MAX_ABS_DIFF", self.tr("Seam maximum absolute spectral difference")))
+        self.addOutput(QgsProcessingOutputNumber(
+            "SEAM_PIXEL_COUNT", self.tr("Seam pixel count")))
+        self.addOutput(QgsProcessingOutputNumber(
+            "SEAM_LENGTH_PX", self.tr("Seam length in pixels")))
 
     # ---- Execution ---------------------------------------------------------
 
@@ -305,6 +319,19 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
                 feedback.pushWarning("Failed to write JSON report: {}".format(str(e)))
 
         feedback.pushInfo("\n" + report)
+        
+        # Log seam consistency metrics
+        if summary["seam_consistency"] is not None:
+            seam_metrics = summary["seam_consistency"]
+            feedback.pushInfo("Seam consistency metrics:")
+            feedback.pushInfo("  Seam mean abs diff: {:.6f}".format(seam_metrics["overall"]["mean_abs_diff"]))
+            feedback.pushInfo("  Seam median abs diff: {:.6f}".format(seam_metrics["overall"]["median_abs_diff"]))
+            feedback.pushInfo("  Seam p95 abs diff: {:.6f}".format(seam_metrics["overall"]["p95_abs_diff"]))
+            feedback.pushInfo("  Seam max abs diff: {:.6f}".format(seam_metrics["overall"]["max_abs_diff"]))
+            feedback.pushInfo("  Seam pixel count: {}".format(seam_metrics["seam_pixel_count"]))
+            feedback.pushInfo("  Seam length (px): {}".format(seam_metrics["seam_length_px"]))
+        else:
+            feedback.pushInfo("Seam consistency metrics: Not available (no sources raster provided)")
 
         return {
             self.OUT_MEAN_RMSE: float(summary["mean_rmse"]),
@@ -331,4 +358,11 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
             self.OUT_SAM_DEG: float(summary["sam_deg"]),
             "COVERAGE_RATIO": float(summary["coverage_ratio"]) if summary["coverage_ratio"] is not None else None,
             "FILLED_PIXEL_RATIO": float(summary["filled_pixel_ratio"]) if summary["filled_pixel_ratio"] is not None else None,
+            # Seam consistency metrics
+            "SEAM_MEAN_ABS_DIFF": float(summary["seam_consistency"]["overall"]["mean_abs_diff"]) if summary["seam_consistency"] is not None else None,
+            "SEAM_MEDIAN_ABS_DIFF": float(summary["seam_consistency"]["overall"]["median_abs_diff"]) if summary["seam_consistency"] is not None else None,
+            "SEAM_P95_ABS_DIFF": float(summary["seam_consistency"]["overall"]["p95_abs_diff"]) if summary["seam_consistency"] is not None else None,
+            "SEAM_MAX_ABS_DIFF": float(summary["seam_consistency"]["overall"]["max_abs_diff"]) if summary["seam_consistency"] is not None else None,
+            "SEAM_PIXEL_COUNT": int(summary["seam_consistency"]["seam_pixel_count"]) if summary["seam_consistency"] is not None else 0,
+            "SEAM_LENGTH_PX": int(summary["seam_consistency"]["seam_length_px"]) if summary["seam_consistency"] is not None else 0,
         }

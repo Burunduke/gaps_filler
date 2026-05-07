@@ -25,6 +25,10 @@ class FlightLineMeta:
     lcf: Optional[Path]       # per-line nav (lat/lon/alt + roll/pitch/yaw + time)
 
 
+# PIKA-L typical band count
+DEFAULT_PIKA_L_BANDS = 280
+
+
 def discover_flight_line(bil_path: Union[str, Path]) -> FlightLineMeta:
     """Given path to a .bil/.bip/.bsq, find sibling .hdr/.times/.lcf by stem."""
     bil = Path(bil_path).resolve()

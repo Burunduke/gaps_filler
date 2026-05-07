@@ -49,7 +49,7 @@ input rasters ──▶ filter ──▶ mosaic ──▶ fill_nodata ──▶ 
 | [`frame_filter_algorithm.py`](frame_filter_algorithm.py) | [`FrameFilterAlgorithm`](frame_filter_algorithm.py:24) — Stage A standalone (`gapsfiller:frame_filter`); copies kept frames to a folder, writes a rejection report. |
 | [`mosaic_algorithm.py`](mosaic_algorithm.py) | [`MosaicAlgorithm`](mosaic_algorithm.py:20) — Stage B standalone (`gapsfiller:mosaic_frames`). |
 | [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py) | [`HyperspectralPipelineAlgorithm`](hyperspectral_algorithm.py:22) — end-to-end (`gapsfiller:hyperspectral_pipeline`). |
-| [`mosaic_quality_algorithm.py`](mosaic_quality_algorithm.py) | [`MosaicQualityAlgorithm`](mosaic_quality_algorithm.py:21) — quality vs reference (`gapsfiller:mosaic_quality`). |
+| [`mosaic_quality_algorithm.py`](mosaic_quality_algorithm.py) | [`MosaicQualityAlgorithm`](mosaic_quality_algorithm.py:21) — quality vs reference (`gapsfiller:mosaic_quality`); now also produces seam-consistency metrics (`SEAM_MEAN_ABS_DIFF` / `SEAM_MEDIAN_ABS_DIFF` / `SEAM_P95_ABS_DIFF` / `SEAM_MAX_ABS_DIFF` / `SEAM_PIXEL_COUNT` / `SEAM_LENGTH_PX`) when a `<output>.sources.tif` provenance raster is available. |
 | [`envi_io.py`](envi_io.py) | ENVI `.hdr` reader — thin wrapper over `spectral.io.envi.read_envi_header`. Public: [`EnviHeader`](envi_io.py:16) frozen dataclass + [`read_envi_header()`](envi_io.py:31). `spectral` is lazy-imported (optional dep). |
 | [`models.py`](models.py) | Passive path-bundling for PIKA-L flight lines. Public: [`FlightLineMeta`](models.py:15) frozen dataclass + [`discover_flight_line()`](models.py:28) (sibling `.hdr` required, `.times` / `.lcf` optional). No I/O, no header parsing. |
 | [`airborne_georef.py`](airborne_georef.py) | PIKA-L pushbroom raw-cube georeferencing. Supports: PIKA-L sidecar parsers ([`read_lcf()`](airborne_georef.py:78), [`read_times()`](airborne_georef.py:101), [`load_flight_line_poses()`](airborne_georef.py:155)); per-frame pose interpolation ([`interpolate_poses()`](airborne_georef.py:117)) aligned by **relative** time (`.lcf` and `.times` epochs differ); flat-earth ground grid ([`flat_ground_grid()`](airborne_georef.py:201)) intersecting per-pixel rays with a flat plane at user-supplied `ground_alt`; DEM-aware ground grid ([`dem_ground_grid()`](airborne_georef.py:541)) iteratively intersecting rays with terrain sampled from a DEM raster; flat / DEM GeoTIFF writer ([`write_flat_geotiff()`](airborne_georef.py:376) with optional `dem_path`) reading the raw `.bil` cube and writing a reprojected GeoTIFF via rasterio geolocation arrays + nearest-neighbor resampling. **Still no QGIS UI wiring** — the writer is callable from Python only. |
@@ -484,9 +484,9 @@ Code-quality sweep across core modules. Behaviour-preserving except where noted;
 - [`airborne_georef.py:400`](airborne_georef.py:400) — `enu2geodetic` unpacking is correct (`lat, lon, alt`).
 
 ### Backlog / deferred
-- I6: expose seam-consistency metrics as [`MosaicQualityAlgorithm`](mosaic_quality_algorithm.py:21) outputs (feature addition, not a bug fix).
-- QGIS-wrapper cosmetic cleanups: extract `_handle_processing_exception` helper, move canvas-styling attachment block to [`canvas_styling.py`](canvas_styling.py:1), replace magic numbers like band-count `280` with named constants.
-- Larger reorganization: split workspace into `src/` (pure Python, GDAL/rasterio logic) and `qgis/` (QGIS Processing wrappers, plugin entry, provider). To be done as a separate task.
+- ✅ done — I6: expose seam-consistency metrics as [`MosaicQualityAlgorithm`](mosaic_quality_algorithm.py:21) outputs (see Recent changes below).
+- ✅ done — QGIS-wrapper cosmetic cleanups: `handle_processing_exception` helper, canvas-styling attachment moved to [`canvas_styling.py`](canvas_styling.py:1), magic-number `280` replaced with `DEFAULT_PIKA_L_BANDS` (see Recent changes below).
+- Deferred: larger reorganization — split workspace into `src/` (pure Python, GDAL/rasterio logic) and `qgis/` (QGIS Processing wrappers, plugin entry, provider). The `src/` half landed; the `qgis/` half is still pending and should be done as a single mechanical rename PR.
 
 ## Changelog — 2026-05-07 Repository reorganization — pure-Python core moved to `src/`
 
@@ -525,5 +525,11 @@ gaps_filler/
 ```
 
 ### Backlog / deferred (carried forward)
-- Expose seam-consistency metrics as [`MosaicQualityAlgorithm`](mosaic_quality_algorithm.py:21) outputs.
-- QGIS-wrapper cosmetic cleanups: extract `_handle_processing_exception` helper, move the canvas-styling attachment block into [`canvas_styling.py`](canvas_styling.py:1), replace magic numbers like band-count default `280` with named constants.
+- ✅ done — seam-consistency metrics exposed on [`MosaicQualityAlgorithm`](mosaic_quality_algorithm.py:21).
+- ✅ done — QGIS-wrapper cosmetic cleanups (helper module + canvas-styling extraction + named band-count constant).
+- Deferred: complete the `src/` + `qgis/` split — pure-Python core already in [`src/`](src/__init__.py:1); QGIS wrappers still at the workspace root and should be moved into a `qgis/` package as a single mechanical rename PR when scheduled.
+
+## Recent changes — 2026-05-07
+
+- **Seam-consistency metrics on Mosaic Quality.** New core function [`compute_seam_consistency()`](src/mosaic_quality.py:1) detects seam pixel pairs as 4-neighbor pairs with different (non-nodata) source IDs and aggregates per-band absolute differences. Six new `QgsProcessingOutputNumber` outputs on [`MosaicQualityAlgorithm`](mosaic_quality_algorithm.py:21): `SEAM_MEAN_ABS_DIFF`, `SEAM_MEDIAN_ABS_DIFF`, `SEAM_P95_ABS_DIFF`, `SEAM_MAX_ABS_DIFF`, `SEAM_PIXEL_COUNT`, `SEAM_LENGTH_PX`. Backward-compatible: `sources_path` defaults to `None`; metric outputs are `None` and counts `0` on empty overlap.
+- **QGIS-wrapper cosmetic cleanups.** New file [`qgis_helpers.py`](qgis_helpers.py:1) with `handle_processing_exception(exc)` consolidating the repeated try/except → `QgsProcessingException` pattern across wrappers. New `attach_rgb_post_processor_if_needed` in [`canvas_styling.py`](canvas_styling.py:1) replaces the inline post-processor blocks in [`gaps_filler_algorithm.py`](gaps_filler_algorithm.py:1), [`mosaic_algorithm.py`](mosaic_algorithm.py:1) and [`airborne_georef_algorithm.py`](airborne_georef_algorithm.py:1). Magic number `280` replaced by `DEFAULT_PIKA_L_BANDS` in [`src/models.py`](src/models.py:1), now used by [`airborne_georef_algorithm.py`](airborne_georef_algorithm.py:1). No public IDs / parameters changed.

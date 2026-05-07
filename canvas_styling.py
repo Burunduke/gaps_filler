@@ -133,3 +133,25 @@ def attach_rgb_post_processor(output_details, band_count):
     pp = _HyperspectralRgbPostProcessor(red, green, blue)
     output_details.setPostProcessor(pp)
     return pp
+
+
+def attach_rgb_post_processor_if_needed(context, output_path, band_count):
+    """Wire an RGB-composite post-processor onto an output layer if needed.
+    
+    This function checks if the layer will be loaded on completion and
+    attaches the RGB post-processor if so.
+    
+    Args:
+        context: QgsProcessingContext
+        output_path: Path to the output file
+        band_count: Number of bands in the raster
+        
+    Returns:
+        The post-processor instance or None if not attached
+    """
+    if context.willLoadLayerOnCompletion(output_path):
+        pending = context.layersToLoadOnCompletion()
+        details = pending.get(output_path)
+        if details is not None:
+            return attach_rgb_post_processor(details, band_count)
+    return None

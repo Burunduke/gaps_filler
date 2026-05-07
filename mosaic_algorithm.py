@@ -27,7 +27,7 @@ from qgis.core import (
 )
 
 from .src import methods, mosaic
-from . import canvas_styling
+from . import canvas_styling, qgis_helpers
 
 
 def _default_mosaic_output(input_paths):
@@ -155,13 +155,8 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
         # default to a near-black band-1 in grayscale otherwise). The
         # mosaic preserves the input band count, so we read it from
         # the first input layer.
-        if context.willLoadLayerOnCompletion(out_path):
-            pending = context.layersToLoadOnCompletion()
-            details = pending.get(out_path)
-            if details is not None:
-                self._rgb_post_processor = (
-                    canvas_styling.attach_rgb_post_processor(
-                        details, layers[0].bandCount()))
+        self._rgb_post_processor = canvas_styling.attach_rgb_post_processor_if_needed(
+            context, out_path, layers[0].bandCount())
 
         def cb(fraction, message):
             if feedback.isCanceled():
@@ -196,16 +191,10 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
                 reproject_to_first=reproject_to_first,
                 emit_coverage_outputs=emit_coverage_outputs,
             )
-        except QgsProcessingException:
-            raise
         except mosaic.MosaicInputError as exc:
             raise QgsProcessingException(str(exc))
-        except RuntimeError as exc:
-            if str(exc) == "canceled":
-                raise QgsProcessingException(self.tr("Canceled by user"))
-            raise QgsProcessingException(str(exc))
         except Exception as exc:
-            raise QgsProcessingException(str(exc))
+            qgis_helpers.handle_processing_exception(exc)
 
         feedback.pushInfo("Mosaic written: {}".format(out_path))
         return {self.OUTPUT: out_path}
