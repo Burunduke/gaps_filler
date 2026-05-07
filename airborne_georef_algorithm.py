@@ -294,8 +294,11 @@ class AirborneGeorefAlgorithm(QgsProcessingAlgorithm):
         boresight_yaw_deg = self.parameterAsDouble(parameters, self.BORESIGHT_YAW_DEG, context)
         time_offset_s = self.parameterAsDouble(parameters, self.TIME_OFFSET_S, context)
         
+        # Get the BIL file path
+        bil_path = Path(bil_layer.source())
+        
         # Read header to get ground elevation if available
-        if bil_path:
+        if bil_path.exists():
             try:
                 # Try to find the header file
                 hdr_primary = bil_path.with_name(bil_path.name + '.hdr')  # foo.bil.hdr
@@ -322,7 +325,6 @@ class AirborneGeorefAlgorithm(QgsProcessingAlgorithm):
         out_path = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
         
         # Validate inputs
-        bil_path = Path(bil_layer.source())
         if not bil_path.exists():
             raise QgsProcessingException(
                 self.tr("Raw cube file not found: {}").format(bil_path))
