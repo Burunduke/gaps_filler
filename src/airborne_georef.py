@@ -416,11 +416,17 @@ def flat_ground_grid(
         # Calculate ENU offsets for valid rays
         east = np.full_like(scale, np.nan)
         north = np.full_like(scale, np.nan)
-        up = ground_alt - aircraft_alt  # Constant for all samples
-        
+        up_scalar = float(ground_alt - aircraft_alt)  # Constant for all samples
+
         east[valid] = scale[valid] * ray_e[valid]
         north[valid] = scale[valid] * ray_n[valid]
-        
+        # Build `up` as an array matching east/north length: some pymap3d
+        # versions don't broadcast a scalar `up` against array east/north
+        # (suspected Windows symptom: enu2geodetic raises -> all pixels
+        # marked invalid silently).
+        n_valid = int(np.count_nonzero(valid))
+        up = np.full(n_valid, up_scalar, dtype=np.float64)
+
         # Diagnostic counts
         _diag_counts["downward"] += int(np.count_nonzero(downward))
         _diag_counts["in_front"] += int(np.count_nonzero(in_front))
@@ -436,39 +442,53 @@ def flat_ground_grid(
                     lat0, lon0, aircraft_alt,
                     deg=True
                 )
-                lon_grid[line, valid] = lon
-                lat_grid[line, valid] = lat
+                lon_grid[line, valid] = np.asarray(lon)
+                lat_grid[line, valid] = np.asarray(lat)
             except Exception as _exc:
                 # If conversion fails, mark as invalid
                 valid_grid[line, :] = False
                 _diag_counts["exc_lines"] += 1
                 if _diag_first_exc[0] is None:
+                    import traceback as _tb
                     _diag_first_exc[0] = (
                         type(_exc).__name__, str(_exc),
-                        "east.shape=%r up=%r lat0=%r lon0=%r aircraft_alt=%r" % (
-                            getattr(east[valid], "shape", None), up,
-                            lat0, lon0, aircraft_alt,
+                        "east.shape=%r up.shape=%r up_scalar=%r lat0=%r lon0=%r "
+                        "aircraft_alt=%r" % (
+                            getattr(east[valid], "shape", None),
+                            getattr(up, "shape", None),
+                            up_scalar, lat0, lon0, aircraft_alt,
                         ),
+                        _tb.format_exc(),
                     )
 
     # --- DIAGNOSTIC SUMMARY ---
-    print(
+    summary = (
         "[flat_ground_grid] summary: downward=%d in_front=%d valid=%d "
-        "exc_lines=%d total_pixels=%d" % (
+        "exc_lines=%d total_pixels=%d ground_alt=%r aircraft_alt(min/mean/max)="
+        "%.3f/%.3f/%.3f pymap3d_module=%r" % (
             _diag_counts["downward"], _diag_counts["in_front"],
             _diag_counts["valid"], _diag_counts["exc_lines"],
-            lines * samples,
-        ),
-        file=_sys.stderr, flush=True,
-    )
-    if _diag_first_exc[0] is not None:
-        print(
-            "[flat_ground_grid] first enu2geodetic exception: %s: %s | %s" % _diag_first_exc[0],
-            file=_sys.stderr, flush=True,
+            lines * samples, ground_alt,
+            float(np.min(poses.alt)), float(np.mean(poses.alt)),
+            float(np.max(poses.alt)),
+            getattr(enu2geodetic, "__module__", None),
         )
-        print(
-            "[flat_ground_grid] pymap3d module: %r" % (getattr(enu2geodetic, "__module__", None),),
-            file=_sys.stderr, flush=True,
+    )
+    print(summary, file=_sys.stderr, flush=True)
+    exc_detail = ""
+    if _diag_first_exc[0] is not None:
+        exc_detail = (
+            "; first enu2geodetic exception: %s: %s | ctx: %s\nTraceback:\n%s"
+            % _diag_first_exc[0]
+        )
+        print(exc_detail, file=_sys.stderr, flush=True)
+
+    # If no valid pixels, raise here with full diagnostics embedded in the
+    # message so QGIS log surfaces the real cause (stderr is not captured by
+    # QGIS on Windows).
+    if not np.any(valid_grid):
+        raise RuntimeError(
+            "No valid geolocation points produced. " + summary + exc_detail
         )
 
     return GroundGrid(lon=lon_grid, lat=lat_grid, alt=alt_grid, valid=valid_grid)
