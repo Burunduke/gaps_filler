@@ -19,13 +19,18 @@ import numpy as np
 from .models import FlightLineMeta, discover_flight_line
 from .envi_io import read_envi_header
 
-# Import for ENU transformations
+# Import for ENU transformations.
+# We deliberately re-raise as a clear error at *call time* if pymap3d is
+# missing, rather than silently degrading: previously the fallback stub
+# raised ImportError inside flat_ground_grid, which was swallowed by a
+# broad `except Exception:` and surfaced only as "No valid geolocation
+# points found in grid" with no hint about the missing dependency.
 try:
     from pymap3d import enu2geodetic
-except ImportError:
-    # Fallback if pymap3d is not available
-    def enu2geodetic(e, n, u, lat0, lon0, h0, ell=None, deg=True):
-        raise ImportError("pymap3d is required for georeferencing. Install with: pip install pymap3d")
+    _PYMAP3D_IMPORT_ERROR: ImportError | None = None
+except ImportError as _exc:
+    enu2geodetic = None  # type: ignore[assignment]
+    _PYMAP3D_IMPORT_ERROR = _exc
 
 # Import for vector writing
 try:
@@ -316,6 +321,25 @@ def flat_ground_grid(
     - Roll/pitch/yaw convention may need calibration/sign flips depending on IMU export.
     - This computes geolocation arrays only; it does not resample imagery.
     """
+    # Fail fast with a clear message if pymap3d is missing, instead of
+    # surfacing the failure as "No valid geolocation points found in grid".
+    if enu2geodetic is None:
+        raise ImportError(
+            "pymap3d is required for georeferencing but is not installed in "
+            "the QGIS Python environment. Install it (e.g. "
+            "`pip install pymap3d`) and restart QGIS. "
+            "Original import error: %s" % _PYMAP3D_IMPORT_ERROR
+        )
+
+    # Validate geometry: ground plane must be below aircraft for any ray to hit.
+    if ground_alt >= float(np.min(poses.alt)):
+        raise ValueError(
+            "ground_alt (%r m) must be below the minimum aircraft altitude "
+            "(%.3f m) for rays to intersect the ground plane." % (
+                ground_alt, float(np.min(poses.alt))
+            )
+        )
+
     # Get view angles for all samples
     angles = sample_view_angles(sensor)  # shape: (samples,)
 
@@ -329,25 +353,10 @@ def flat_ground_grid(
     alt_grid = np.full((lines, samples), ground_alt, dtype=np.float64)
     valid_grid = np.zeros((lines, samples), dtype=bool)
 
-    # --- DIAGNOSTIC LOGGING (debug Windows "No valid geolocation points") ---
-    import sys as _sys
-    print(
-        "[flat_ground_grid] lines=%d samples=%d ground_alt=%r "
-        "aircraft_alt min=%.3f max=%.3f mean=%.3f fov_deg=%r" % (
-            lines, samples, ground_alt,
-            float(np.min(poses.alt)), float(np.max(poses.alt)),
-            float(np.mean(poses.alt)), sensor.fov_deg,
-        ),
-        file=_sys.stderr, flush=True,
-    )
-    if ground_alt >= float(np.min(poses.alt)):
-        print(
-            "[flat_ground_grid] WARNING: ground_alt (%r) >= min aircraft alt (%.3f); "
-            "rays cannot hit ground." % (ground_alt, float(np.min(poses.alt))),
-            file=_sys.stderr, flush=True,
-        )
-    _diag_first_exc = [None]
-    _diag_counts = {"downward": 0, "in_front": 0, "valid": 0, "exc_lines": 0}
+    # Track the first exception encountered inside the per-line loop so we can
+    # surface it in the final error message instead of silently masking pixels.
+    _first_exc: BaseException | None = None
+    _exc_lines = 0
     
     # Process each line/frame
     for line in range(lines):
@@ -445,50 +454,36 @@ def flat_ground_grid(
                 lon_grid[line, valid] = np.asarray(lon)
                 lat_grid[line, valid] = np.asarray(lat)
             except Exception as _exc:
-                # If conversion fails, mark as invalid
+                # Don't mask the failure indefinitely; remember the first
+                # error so it surfaces in the final RuntimeError below.
                 valid_grid[line, :] = False
-                _diag_counts["exc_lines"] += 1
-                if _diag_first_exc[0] is None:
-                    import traceback as _tb
-                    _diag_first_exc[0] = (
-                        type(_exc).__name__, str(_exc),
-                        "east.shape=%r up.shape=%r up_scalar=%r lat0=%r lon0=%r "
-                        "aircraft_alt=%r" % (
-                            getattr(east[valid], "shape", None),
-                            getattr(up, "shape", None),
-                            up_scalar, lat0, lon0, aircraft_alt,
-                        ),
-                        _tb.format_exc(),
-                    )
+                _exc_lines += 1
+                if _first_exc is None:
+                    _first_exc = _exc
 
-    # --- DIAGNOSTIC SUMMARY ---
-    summary = (
-        "[flat_ground_grid] summary: downward=%d in_front=%d valid=%d "
-        "exc_lines=%d total_pixels=%d ground_alt=%r aircraft_alt(min/mean/max)="
-        "%.3f/%.3f/%.3f pymap3d_module=%r" % (
-            _diag_counts["downward"], _diag_counts["in_front"],
-            _diag_counts["valid"], _diag_counts["exc_lines"],
-            lines * samples, ground_alt,
-            float(np.min(poses.alt)), float(np.mean(poses.alt)),
-            float(np.max(poses.alt)),
-            getattr(enu2geodetic, "__module__", None),
-        )
-    )
-    print(summary, file=_sys.stderr, flush=True)
-    exc_detail = ""
-    if _diag_first_exc[0] is not None:
-        exc_detail = (
-            "; first enu2geodetic exception: %s: %s | ctx: %s\nTraceback:\n%s"
-            % _diag_first_exc[0]
-        )
-        print(exc_detail, file=_sys.stderr, flush=True)
-
-    # If no valid pixels, raise here with full diagnostics embedded in the
-    # message so QGIS log surfaces the real cause (stderr is not captured by
-    # QGIS on Windows).
+    # If no valid pixels, raise here with the underlying cause embedded in
+    # the message so QGIS log surfaces the real reason (stderr is not
+    # captured reliably by QGIS, especially on Windows).
     if not np.any(valid_grid):
+        detail = (
+            "ground_alt=%r aircraft_alt(min/mean/max)=%.3f/%.3f/%.3f "
+            "exc_lines=%d/%d pymap3d_module=%r" % (
+                ground_alt,
+                float(np.min(poses.alt)), float(np.mean(poses.alt)),
+                float(np.max(poses.alt)),
+                _exc_lines, lines,
+                getattr(enu2geodetic, "__module__", None),
+            )
+        )
+        if _first_exc is not None:
+            raise RuntimeError(
+                "No valid geolocation points produced; first underlying "
+                "error: %s: %s. Context: %s" % (
+                    type(_first_exc).__name__, _first_exc, detail
+                )
+            ) from _first_exc
         raise RuntimeError(
-            "No valid geolocation points produced. " + summary + exc_detail
+            "No valid geolocation points produced. Context: " + detail
         )
 
     return GroundGrid(lon=lon_grid, lat=lat_grid, alt=alt_grid, valid=valid_grid)
@@ -949,6 +944,15 @@ def dem_ground_grid(
     Returns:
     - GroundGrid with lon/lat/alt/valid arrays for each pixel
     """
+    # Fail fast with a clear message if pymap3d is missing.
+    if enu2geodetic is None:
+        raise ImportError(
+            "pymap3d is required for georeferencing but is not installed in "
+            "the QGIS Python environment. Install it (e.g. "
+            "`pip install pymap3d`) and restart QGIS. "
+            "Original import error: %s" % _PYMAP3D_IMPORT_ERROR
+        )
+
     # Check if DEM path exists
     if dem_path is None:
         raise ValueError("DEM path is required but not provided")
