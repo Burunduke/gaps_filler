@@ -857,6 +857,12 @@ def write_flat_geotiff(
                              "Suggest using GDAL Warp/GCP fallback for next iteration.")
         
         # Write output profile
+        if nodata is None:
+            if np.issubdtype(np.dtype(src.dtypes[0]), np.floating):
+                nodata = float("nan")
+            else:
+                nodata = 0
+        
         profile = {
             'driver': 'GTiff',
             'count': src.count,
@@ -869,8 +875,7 @@ def write_flat_geotiff(
             'BIGTIFF': 'IF_SAFER'
         }
         
-        if nodata is not None:
-            profile['nodata'] = nodata
+        profile['nodata'] = nodata
         
         # Write the georeferenced GeoTIFF
         with rasterio.open(output_path, 'w', **profile) as dst:
@@ -883,6 +888,9 @@ def write_flat_geotiff(
                     destination=rasterio.band(dst, b),
                     src_geoloc_array=(grid.lon, grid.lat),  # Use actual geolocation arrays
                     src_crs=CRS.from_string("EPSG:4326"),
+                    src_nodata=src.nodata,
+                    dst_nodata=nodata,
+                    init_dest_nodata=True,
                     dst_transform=transform,
                     dst_crs=dst_crs,
                     resampling=Resampling.nearest,
