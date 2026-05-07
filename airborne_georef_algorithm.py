@@ -306,24 +306,45 @@ class AirborneGeorefAlgorithm(QgsProcessingAlgorithm):
         try:
             if hdr_path or times_path or lcf_path:
                 # Use provided paths, fallback to auto-discovery for missing ones
-                hdr = Path(hdr_path) if hdr_path else bil_path.with_suffix('.hdr')
-                if not hdr.exists():
-                    raise QgsProcessingException(
-                        self.tr("Required header file not found: {}").format(hdr))
+                if hdr_path:
+                    hdr = Path(hdr_path)
+                    if not hdr.exists():
+                        raise QgsProcessingException(
+                            self.tr("Specified HDR file not found: {}").format(hdr))
+                else:
+                    # Auto-discover HDR: try <bil_path>.hdr first, then <basename>.hdr
+                    hdr_primary = bil_path.with_name(bil_path.name + '.hdr')  # foo.bil.hdr
+                    hdr_fallback = bil_path.with_suffix('.hdr')               # foo.hdr
+                    hdr = hdr_primary if hdr_primary.exists() else hdr_fallback
+                    if not hdr.exists():
+                        raise QgsProcessingException(
+                            self.tr("Required header file not found: {} or {}").format(hdr_primary, hdr_fallback))
                 
-                times = Path(times_path) if times_path else bil_path.with_suffix('.times')
-                if times_path and not times.exists():
-                    raise QgsProcessingException(
-                        self.tr("Specified TIMES file not found: {}").format(times))
-                elif not times_path and not times.exists():
-                    times = None
+                if times_path:
+                    times = Path(times_path)
+                    if not times.exists():
+                        raise QgsProcessingException(
+                            self.tr("Specified TIMES file not found: {}").format(times))
+                else:
+                    # Auto-discover TIMES: try <bil_path>.times first, then <basename>.times
+                    times_primary = bil_path.with_name(bil_path.name + '.times')  # foo.bil.times
+                    times_fallback = bil_path.with_suffix('.times')               # foo.times
+                    times = times_primary if times_primary.exists() else times_fallback
+                    if not times.exists():
+                        times = None
                 
-                lcf = Path(lcf_path) if lcf_path else bil_path.with_suffix('.lcf')
-                if lcf_path and not lcf.exists():
-                    raise QgsProcessingException(
-                        self.tr("Specified LCF file not found: {}").format(lcf))
-                elif not lcf_path and not lcf.exists():
-                    lcf = None
+                if lcf_path:
+                    lcf = Path(lcf_path)
+                    if not lcf.exists():
+                        raise QgsProcessingException(
+                            self.tr("Specified LCF file not found: {}").format(lcf))
+                else:
+                    # Auto-discover LCF: try <basename>.lcf first, then <bil_path>.lcf
+                    lcf_primary = bil_path.with_suffix('.lcf')               # foo.lcf
+                    lcf_fallback = bil_path.with_name(bil_path.name + '.lcf')  # foo.bil.lcf
+                    lcf = lcf_primary if lcf_primary.exists() else lcf_fallback
+                    if not lcf.exists():
+                        lcf = None
                 
                 name = bil_path.stem
                 meta = models.FlightLineMeta(

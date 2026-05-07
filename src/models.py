@@ -30,25 +30,39 @@ DEFAULT_PIKA_L_BANDS = 280
 
 
 def discover_flight_line(bil_path: Union[str, Path]) -> FlightLineMeta:
-    """Given path to a .bil/.bip/.bsq, find sibling .hdr/.times/.lcf by stem."""
+    """Given path to a .bil/.bip/.bsq, find sibling .hdr/.times/.lcf files.
+    
+    Supports both naming conventions:
+    - HDR: <bil_path>.hdr (e.g. foo.bil.hdr), with fallback to <basename>.hdr
+    - TIMES: <bil_path>.times (e.g. foo.bil.times), with fallback to <basename>.times
+    - LCF: <basename>.lcf (e.g. foo.lcf), with fallback to <bil_path>.lcf
+    """
     bil = Path(bil_path).resolve()
     
     # Check if the .bil file exists
     if not bil.exists():
         raise FileNotFoundError(f"File not found: {bil}")
     
-    # Check if the .hdr file exists
-    hdr = bil.with_suffix('.hdr')
+    # Check for .hdr file - try <bil_path>.hdr first, then <basename>.hdr
+    hdr_primary = bil.with_name(bil.name + '.hdr')  # foo.bil.hdr
+    hdr_fallback = bil.with_suffix('.hdr')          # foo.hdr
+    hdr = hdr_primary if hdr_primary.exists() else hdr_fallback
     if not hdr.exists():
-        raise FileNotFoundError(f"Required header file not found: {hdr}")
+        raise FileNotFoundError(f"Required header file not found: {hdr_primary} or {hdr_fallback}")
     
-    # Check for optional .times file
-    times_path = bil.with_suffix('.times')
-    times = times_path if times_path.exists() else None
+    # Check for .times file - try <bil_path>.times first, then <basename>.times
+    times_primary = bil.with_name(bil.name + '.times')  # foo.bil.times
+    times_fallback = bil.with_suffix('.times')          # foo.times
+    times = times_primary if times_primary.exists() else times_fallback
+    if not times.exists():
+        times = None
     
-    # Check for optional .lcf file
-    lcf_path = bil.with_suffix('.lcf')
-    lcf = lcf_path if lcf_path.exists() else None
+    # Check for .lcf file - try <basename>.lcf first, then <bil_path>.lcf
+    lcf_fallback = bil.with_name(bil.name + '.lcf')  # foo.bil.lcf
+    lcf_primary = bil.with_suffix('.lcf')            # foo.lcf
+    lcf = lcf_primary if lcf_primary.exists() else lcf_fallback
+    if not lcf.exists():
+        lcf = None
     
     # Extract name from the stem of the .bil file
     name = bil.stem
