@@ -6,15 +6,16 @@ into a single tiled BigTIFF, processed band-by-band to keep memory
 bounded. Output is ``float32`` with ``NaN`` as NoData. The active
 mosaic method is selected at the call site via
 :data:`methods.MOSAIC_METHODS`; only the spectrally-faithful ``v1``
-first-write-wins path is registered. The visual-only feather and
-histmatch+feather variants below are kept as unregistered helpers
-(no longer reachable from QGIS) so the project keeps a single
-exact-data mosaic path.
+first-write-wins path and the ``v2`` best pixel path are registered.
+The visual-only feather and histmatch+feather variants were previously
+kept as unregistered helpers but have been removed to simplify the codebase.
+
 
 Public API:
     * :class:`MosaicInputError` — raised on incompatible inputs.
     * :func:`validate_inputs` — cross-frame compatibility check.
     * :func:`mosaic_frames` — v1 first-write-wins band-streaming writer.
+    * :func:`mosaic_frames_best_pixel` — v2 best pixel band-streaming writer.
 
 Dependencies are limited to ``rasterio``, ``numpy`` and the Python
 stdlib; in particular this module must not import ``osgeo.gdal`` or
@@ -353,56 +354,48 @@ def mosaic_frames(
     return output_path
 
 
+
 # ---------------------------------------------------------------------------
-# v4 — Feathered / weighted blending
+# v2 — Best pixel (max distance to edge)
 # ---------------------------------------------------------------------------
 
 
-def _feather_weights(valid_mask: np.ndarray, max_feather_pixels: int) -> np.ndarray:
-    """Per-pixel blend weight = distance-to-edge clipped to a ramp.
-
-    ``valid_mask`` is a 2-D bool array (True = valid data). Pixels at the
-    frame edge get weight 0; pixels deeper than ``max_feather_pixels``
-    inside the valid region all get weight 1. NoData pixels are 0. The
-    distance transform runs once per (chunk, band) read so memory stays
-    bounded by a single 2-D float32 plane per source.
-    """
-    if max_feather_pixels <= 0:
-        # Degenerate: behave like uniform weights inside the mask.
-        return valid_mask.astype(np.float32)
-    # ``distance_transform_edt`` gives Euclidean distance from each True
-    # pixel to the nearest False (i.e. nearest edge / NoData) pixel.
-    dist = distance_transform_edt(valid_mask)
-    weights = np.minimum(
-        dist / float(max_feather_pixels), 1.0).astype(np.float32)
-    # Edge pixels still get tiny weights; only fully-invalid pixels are 0.
-    weights[~valid_mask] = 0.0
-    return weights
-
-
-def mosaic_frames_feather(
+def mosaic_frames_best_pixel(
     paths: list[str],
     output_path: str,
     *,
     progress: Optional[Callable[[float, str], None]] = None,
     reproject_to_first: bool = False,
-    max_feather_pixels: int = 32,
+    write_sources: bool = True,
 ) -> str:
-    """Mosaic ``paths`` with distance-to-edge feathered blending.
-
-    For every input frame we compute a per-pixel weight equal to the
-    Euclidean distance from each valid pixel to the nearest invalid
-    (NoData / off-frame) pixel, clipped to ``max_feather_pixels``. The
-    output pixel is then ``sum(w * value) / sum(w)`` across overlapping
-    frames; pixels covered by no frame stay NaN. Spectrally less
-    faithful than v1 (overlap zones blur a few frames together) but
-    produces seamless visual mosaics — see the v4 entry in
-    ``hyperspectral_plan.md``.
-
+    """Mosaic ``paths`` by picking the source with the best (most interior) pixel.
+    
+    For each output pixel covered by ≥1 input frame, pick the source whose pixel is
+    **farthest from any nodata edge** (most "interior" pixel). Copy that source's
+    full spectrum (all bands) into the output. Ties → input order.
+    
     Same call shape as :func:`mosaic_frames` so the registry can dispatch
     interchangeably. Output is ``float32`` BigTIFF with NaN as NoData.
     Frames are processed band-by-band and in chunks of
     ``_MAX_OPEN_SOURCES`` to keep both file descriptors and memory bounded.
+    
+    Parameters
+    ----------
+    paths : list[str]
+        List of input frame paths to mosaic
+    output_path : str
+        Path to write the output mosaic
+    progress : Optional[Callable[[float, str], None]]
+        Optional progress callback function
+    reproject_to_first : bool
+        Whether to reproject frames to match the first frame's CRS/resolution
+    write_sources : bool
+        Whether to write the optional sources provenance raster
+        
+    Returns
+    -------
+    str
+        Path to the output mosaic
     """
     info = validate_inputs(paths, reproject_to_first=reproject_to_first)
     xres, yres = info["res"]
@@ -410,10 +403,7 @@ def mosaic_frames_feather(
     src_nodata = info["nodata"]
     ref_crs = info["crs"]
 
-    # Optional reprojection pass — same logic as ``mosaic_frames``; we
-    # rewrite ``effective_paths`` to point at temp GeoTIFFs reprojected
-    # onto the first frame's grid so the rest of the function can stay
-    # uniform.
+    # Optional reprojection pass — same logic as other mosaic methods
     tmp_dir: Optional[str] = None
     effective_paths: list[str] = list(paths)
     if reproject_to_first:
@@ -477,31 +467,52 @@ def mosaic_frames_feather(
         isinstance(src_nodata, float) and np.isnan(src_nodata)
     )
 
+    # Split paths into chunks so we never hold more than _MAX_OPEN_SOURCES
+    # file descriptors open at once.
     path_chunks = [
         effective_paths[i:i + _MAX_OPEN_SOURCES]
         for i in range(0, len(effective_paths), _MAX_OPEN_SOURCES)
     ]
 
+    # Derive sources raster path if needed
+    sources_path = None
+    if write_sources:
+        base, ext = os.path.splitext(output_path)
+        sources_path = base + ".sources.tif"
+
     try:
         with rasterio.open(output_path, "w", **profile) as dst:
+            # Create sources raster if needed
+            sources_dst = None
+            if sources_path:
+                sources_profile = profile.copy()
+                sources_profile.update(
+                    count=1,
+                    dtype="uint16",
+                    nodata=0,
+                )
+                sources_dst = rasterio.open(sources_path, "w", **sources_profile)
+
             total_steps = len(path_chunks) * band_count
             step = 0
-            # One pair of accumulators per band; allocated once per band
-            # and reused across all chunks. We accumulate ``Σ(w·v)`` and
-            # ``Σ(w)`` for that band, then divide once at the end.
-            for b in range(1, band_count + 1):
-                wsum = np.zeros((height, width), dtype=np.float32)
-                wvsum = np.zeros((height, width), dtype=np.float32)
 
+            # Process each band
+            for b in range(1, band_count + 1):
+                # Initialize best distance and source arrays for this band
+                # These will be updated across all chunks for this band
+                best_dist = np.zeros((height, width), dtype=np.float32)
+                best_src = np.zeros((height, width), dtype=np.uint16)  # 0 = nodata, 1-based source indices
+
+                # Process each chunk
                 for chunk_idx, chunk in enumerate(path_chunks):
                     sources = [rasterio.open(p) for p in chunk]
                     try:
-                        # For each source, read its band ``b`` reprojected
-                        # onto the output grid (via merge on a one-source
-                        # list — same trick the rest of the file uses).
-                        # Then build a feather weight from the validity
-                        # mask and accumulate.
-                        for src in sources:
+                        # For each source in the chunk, compute distance transform and update best
+                        for src_idx_in_chunk, src in enumerate(sources):
+                            # Source index is 1-based across all inputs
+                            src_idx = chunk_idx * _MAX_OPEN_SOURCES + src_idx_in_chunk + 1
+                            
+                            # Read the band data reprojected onto output grid
                             arr_3d, _ = merge(
                                 [src],
                                 indexes=[b],
@@ -514,23 +525,27 @@ def mosaic_frames_feather(
                             arr = arr_3d[0]
                             if arr.dtype != np.float32:
                                 arr = arr.astype(np.float32)
-                            # Normalise per-source NoData to NaN so the
-                            # validity mask is uniform downstream.
+                            # Normalise per-source NoData to NaN
                             if (src_nodata is not None
                                     and not nodata_is_nan):
                                 arr[arr == np.float32(src_nodata)] = nan
 
-                            valid = np.isfinite(arr)
-                            if not valid.any():
+                            # Build validity mask (True where all bands are valid for this source)
+                            # For single band processing, this is just finite values
+                            valid_mask = np.isfinite(arr)
+                            
+                            # Skip if no valid data
+                            if not valid_mask.any():
                                 continue
-                            w = _feather_weights(
-                                valid, int(max_feather_pixels))
-                            # Replace NaN with 0 inside the weighted sum
-                            # so NaN never propagates through addition.
-                            contrib = np.where(valid, arr, 0.0).astype(
-                                np.float32)
-                            wvsum += w * contrib
-                            wsum += w
+                                
+                            # Compute distance transform for this source
+                            distance = distance_transform_edt(valid_mask)
+                            
+                            # Update best distance and source where this source is better
+                            # (valid pixel AND greater distance than current best)
+                            update_mask = valid_mask & (distance > best_dist)
+                            best_dist[update_mask] = distance[update_mask]
+                            best_src[update_mask] = src_idx
                     finally:
                         for s in sources:
                             s.close()
@@ -539,294 +554,69 @@ def mosaic_frames_feather(
                     if progress is not None:
                         progress(
                             step / total_steps,
-                            "feather chunk {}/{} band {}/{}".format(
+                            "best-pixel chunk {}/{} band {}/{}".format(
                                 chunk_idx + 1, len(path_chunks),
                                 b, band_count),
                         )
 
-                # Divide once per band; pixels covered by no frame stay
-                # NaN. Suppress the divide-by-zero warning for empty
-                # pixels — they are explicitly masked back to NaN.
-                with np.errstate(invalid="ignore", divide="ignore"):
-                    out = np.where(wsum > 0.0, wvsum / wsum, nan).astype(
-                        np.float32)
-                dst.write(out, b)
-
-            if descriptions:
-                for i, desc in enumerate(descriptions, start=1):
-                    if desc:
-                        dst.set_band_description(i, desc)
-    finally:
-        if tmp_dir is not None:
-            for name in os.listdir(tmp_dir):
-                try:
-                    os.remove(os.path.join(tmp_dir, name))
-                except OSError:
-                    pass
-            try:
-                os.rmdir(tmp_dir)
-            except OSError:
-                pass
-
-    return output_path
-
-
-# ---------------------------------------------------------------------------
-# v5 — Histogram match (mean/std moment matching) + feather
-# ---------------------------------------------------------------------------
-
-
-def _moment_match_gain_offset(
-    ref_vals: np.ndarray,
-    src_vals: np.ndarray,
-) -> tuple[float, float]:
-    """Compute (gain, offset) so that ``gain * src + offset`` matches
-    the mean and std of ``ref_vals``.
-
-    Both inputs are 1-D arrays of finite samples. We deliberately use
-    simple mean/std moment matching (not a CDF / histogram-equalisation
-    match): it is junior-readable, monotonic, easy to reason about, and
-    enough to kill the brightness / contrast jumps between adjacent
-    PIKA-L strips that v4's feather alone cannot hide. A more
-    sophisticated CDF-based match is intentionally not used here.
-    """
-    if ref_vals.size == 0 or src_vals.size == 0:
-        return 1.0, 0.0
-    ref_mean = float(np.mean(ref_vals))
-    ref_std = float(np.std(ref_vals))
-    src_mean = float(np.mean(src_vals))
-    src_std = float(np.std(src_vals))
-    # std == 0 in either side → matching is undefined; skip.
-    if ref_std == 0.0 or src_std == 0.0:
-        return 1.0, 0.0
-    gain = ref_std / src_std
-    offset = ref_mean - gain * src_mean
-    return gain, offset
-
-
-def mosaic_frames_histmatch_feather(
-    paths: list[str],
-    output_path: str,
-    *,
-    progress: Optional[Callable[[float, str], None]] = None,
-    reproject_to_first: bool = False,
-    max_feather_pixels: int = 32,
-) -> str:
-    """Mosaic ``paths`` with linear histogram matching + feather blend.
-
-    Variant of :func:`mosaic_frames_feather` that first rescales each
-    non-reference frame so its per-band mean and std match the
-    reference frame's per-band mean and std on their overlap, then runs
-    the SAME feather blend as v4 to hide the residual seams.
-
-    Reference frame selection rule: the FIRST input frame
-    (``paths[0]``). Simple, deterministic, and matches the order the
-    user provides. No statistics from overlap → fall back to the
-    reference's global mean/std for that band. ``std == 0`` in either
-    side → skip matching for that band (gain = 1, offset = 0).
-
-    ⚠️ Warning: this method ALTERS per-pixel spectral values. Use it
-    only when visual continuity matters more than spectral accuracy.
-    For classifiers, indices, or any spectral analysis, use v1 (or v4
-    with a single band of interest) instead.
-
-    Same call shape as :func:`mosaic_frames_feather`. Output is
-    ``float32`` BigTIFF with NaN as NoData.
-    """
-    info = validate_inputs(paths, reproject_to_first=reproject_to_first)
-    xres, yres = info["res"]
-    band_count = info["count"]
-    src_nodata = info["nodata"]
-    ref_crs = info["crs"]
-
-    # Optional reprojection pass — same logic as v1 / v4.
-    tmp_dir: Optional[str] = None
-    effective_paths: list[str] = list(paths)
-    if reproject_to_first:
-        tmp_dir = tempfile.mkdtemp(prefix="mosaic_reproj_")
-        for i, p in enumerate(paths):
-            with rasterio.open(p) as src:
-                same_crs = (src.crs == ref_crs)
-                xr = abs(src.transform.a)
-                yr = abs(src.transform.e)
-                same_res = (
-                    abs(xr - xres) <= _PIXEL_REL_TOL * xres
-                    and abs(yr - yres) <= _PIXEL_REL_TOL * yres)
-            if same_crs and same_res:
-                continue
-            effective_paths[i] = _reproject_to_reference(
-                p, ref_crs=ref_crs, ref_xres=xres, ref_yres=yres,
-                out_dir=tmp_dir,
-            )
-
-    # Union of all frame bounds (in ``ref_crs``).
-    lefts, bottoms, rights, tops = [], [], [], []
-    for p in effective_paths:
-        with rasterio.open(p) as src:
-            b = src.bounds
-            lefts.append(b.left)
-            bottoms.append(b.bottom)
-            rights.append(b.right)
-            tops.append(b.top)
-    left, bottom = min(lefts), min(bottoms)
-    right, top = max(rights), max(tops)
-
-    width = int(round((right - left) / xres))
-    height = int(round((top - bottom) / yres))
-    out_transform = from_origin(left, top, xres, yres)
-    out_bounds = (left, bottom, right, top)
-
-    with rasterio.open(effective_paths[0]) as first:
-        profile = first.profile.copy()
-        descriptions = first.descriptions
-
-    for k in ("predictor", "photometric"):
-        profile.pop(k, None)
-    profile.update(
-        driver="GTiff",
-        dtype="float32",
-        nodata=float("nan"),
-        count=band_count,
-        width=width,
-        height=height,
-        transform=out_transform,
-        crs=info["crs"],
-        tiled=True,
-        blockxsize=512,
-        blockysize=512,
-        compress="deflate",
-        BIGTIFF="YES",
-    )
-
-    nan = np.float32("nan")
-    nodata_is_nan = (
-        isinstance(src_nodata, float) and np.isnan(src_nodata)
-    )
-
-    # Reference frame is the first input. We open it on demand per band
-    # (cheap — one rasterio.open per band) so we don't keep N file
-    # descriptors alive across the whole loop. Note we deliberately do
-    # NOT chunk the inputs the way v1 / v4 do across _MAX_OPEN_SOURCES,
-    # because we open and close one source at a time here (gain/offset
-    # is computed against the reference, accumulated, then released).
-    ref_path = effective_paths[0]
-
-    def _read_on_grid(src, band_index):
-        """Read ``band_index`` from ``src`` reprojected onto the output
-        grid, returning a 2-D float32 array with NaN as NoData."""
-        arr_3d, _ = merge(
-            [src],
-            indexes=[band_index],
-            method="first",
-            dtype="float32",
-            nodata=nan,
-            res=(xres, yres),
-            bounds=out_bounds,
-        )
-        a = arr_3d[0]
-        if a.dtype != np.float32:
-            a = a.astype(np.float32)
-        if src_nodata is not None and not nodata_is_nan:
-            a[a == np.float32(src_nodata)] = nan
-        return a
-
-    try:
-        with rasterio.open(output_path, "w", **profile) as dst:
-            total_steps = len(effective_paths) * band_count
-            step = 0
-
-            for b in range(1, band_count + 1):
-                # Per-band feather accumulators (same as v4).
-                wsum = np.zeros((height, width), dtype=np.float32)
-                wvsum = np.zeros((height, width), dtype=np.float32)
-
-                # Read the reference frame's band onto the output grid
-                # once per band; we need it both for histogram matching
-                # statistics AND to contribute to the feather blend.
-                with rasterio.open(ref_path) as ref_src:
-                    ref_arr = _read_on_grid(ref_src, b)
-                ref_valid = np.isfinite(ref_arr)
-
-                # Reference frame's own contribution (gain = 1, offset = 0).
-                if ref_valid.any():
-                    w_ref = _feather_weights(
-                        ref_valid, int(max_feather_pixels))
-                    contrib_ref = np.where(
-                        ref_valid, ref_arr, 0.0).astype(np.float32)
-                    wvsum += w_ref * contrib_ref
-                    wsum += w_ref
-
-                step += 1
-                if progress is not None:
-                    progress(
-                        step / total_steps,
-                        "histmatch+feather ref band {}/{}".format(
-                            b, band_count),
-                    )
-
-                # Precompute reference global stats for the no-overlap
-                # fallback so we don't recompute per source.
-                ref_finite = ref_arr[ref_valid] if ref_valid.any() else None
-
-                for src_path in effective_paths[1:]:
-                    with rasterio.open(src_path) as src:
-                        src_arr = _read_on_grid(src, b)
-                    src_valid = np.isfinite(src_arr)
-                    if not src_valid.any():
-                        step += 1
-                        if progress is not None:
-                            progress(
-                                step / total_steps,
-                                "histmatch+feather skip empty band {}/{}"
-                                .format(b, band_count),
+                # After processing all chunks for this band, gather pixels per source
+                # and read that band from each source for those pixels
+                out_band = np.full((height, width), nan, dtype=np.float32)
+                
+                # Process each source to fill in its pixels
+                for chunk_idx, chunk in enumerate(path_chunks):
+                    sources = [rasterio.open(p) for p in chunk]
+                    try:
+                        for src_idx_in_chunk, src in enumerate(sources):
+                            src_idx = chunk_idx * _MAX_OPEN_SOURCES + src_idx_in_chunk + 1
+                            
+                            # Find pixels that should come from this source
+                            src_pixels = best_src == src_idx
+                            if not src_pixels.any():
+                                continue
+                                
+                            # Read the band data for this source reprojected onto output grid
+                            arr_3d, _ = merge(
+                                [src],
+                                indexes=[b],
+                                method="first",
+                                dtype="float32",
+                                nodata=nan,
+                                res=(xres, yres),
+                                bounds=out_bounds,
                             )
-                        continue
+                            arr = arr_3d[0]
+                            if arr.dtype != np.float32:
+                                arr = arr.astype(np.float32)
+                            # Normalise per-source NoData to NaN
+                            if (src_nodata is not None
+                                    and not nodata_is_nan):
+                                arr[arr == np.float32(src_nodata)] = nan
+                                
+                            # Fill in pixels from this source
+                            out_band[src_pixels] = arr[src_pixels]
+                    finally:
+                        for s in sources:
+                            s.close()
+                
+                # Write the band to output
+                dst.write(out_band, b)
+                
+                # Write sources band if needed (only for first band since it's the same for all)
+                if b == 1 and sources_dst is not None:
+                    sources_dst.write(best_src, 1)
 
-                    # Compute (gain, offset) on overlap pixels.
-                    overlap = ref_valid & src_valid
-                    if overlap.any():
-                        gain, offset = _moment_match_gain_offset(
-                            ref_arr[overlap], src_arr[overlap])
-                    elif ref_finite is not None:
-                        # No overlap: fall back to reference's GLOBAL
-                        # mean/std vs this source's global mean/std.
-                        gain, offset = _moment_match_gain_offset(
-                            ref_finite, src_arr[src_valid])
-                    else:
-                        # Reference itself is empty for this band.
-                        gain, offset = 1.0, 0.0
-
-                    # Apply gain/offset across the whole frame's band.
-                    matched = np.where(
-                        src_valid,
-                        np.float32(gain) * src_arr + np.float32(offset),
-                        np.float32(0.0),
-                    ).astype(np.float32)
-
-                    # Feather blend, identical to v4 inner body.
-                    w = _feather_weights(
-                        src_valid, int(max_feather_pixels))
-                    wvsum += w * matched
-                    wsum += w
-
-                    step += 1
-                    if progress is not None:
-                        progress(
-                            step / total_steps,
-                            "histmatch+feather band {}/{}".format(
-                                b, band_count),
-                        )
-
-                with np.errstate(invalid="ignore", divide="ignore"):
-                    out = np.where(wsum > 0.0, wvsum / wsum, nan).astype(
-                        np.float32)
-                dst.write(out, b)
-
+            # Write band descriptions if available
             if descriptions:
                 for i, desc in enumerate(descriptions, start=1):
                     if desc:
                         dst.set_band_description(i, desc)
+                        
+            # Close sources raster if it was opened
+            if sources_dst is not None:
+                sources_dst.close()
     finally:
+        # Best-effort cleanup of any temporary reprojected frames.
         if tmp_dir is not None:
             for name in os.listdir(tmp_dir):
                 try:
@@ -839,3 +629,4 @@ def mosaic_frames_histmatch_feather(
                 pass
 
     return output_path
+

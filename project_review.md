@@ -40,8 +40,8 @@ The five algorithms appear in **Processing Toolbox → Hyperspectral gaps filler
 
 **Method registries (driven by [`methods.py`](methods.py:1), one entry per implemented version):**
 - `FRAME_FILTER_METHODS` — `v1_hard_thresholds` (default), `v2_adaptive_mad` (per-flight adaptive MAD thresholds), `v3_per_band` (per-band striping / dropout detection).
-- `MOSAIC_METHODS` — `v1_first_write_wins` only. The visual-only `v4_feather` and `v5_histmatch_feather` variants were unregistered (see "Project policy — data correctness over visual appearance" below) so the only reachable mosaic path is spectrally exact.
-- `GAP_FILL_METHODS` — `v2_idw_quadrants` (default, pure-Python), `v3_gdal_fillnodata` (native C, optional fallback to v2 on failure).
+- `MOSAIC_METHODS` — `v1_first_write_wins` and `v2_best_pixel` (default since 2026-05-07 — recommended). Both are spectrally faithful (every output pixel comes from exactly one source frame, no mixing). The visual-only `v4_feather` and `v5_histmatch_feather` variants were removed (see "Project policy — data correctness over visual appearance" below).
+- `GAP_FILL_METHODS` — `v3_gdal_fillnodata` (default since 2026-05-07, native C, optional fallback to v2 on failure), `v2_idw_quadrants` (pure-Python).
 
 **QGIS algorithm parameters now exposed:**
 - Stage A core: `INPUT_LAYERS`, 8 raw thresholds (`SKEW_MAX`, `AREA_LO`, `AREA_HI`, `ASPECT_MAX`, `CENTRE_WINDOW`, `MIN_VALID_FRACTION`, `STD_MIN`, `SATURATION_FRACTION`), `THRESHOLD_PRESET` (Custom / Permissive / Default / Strict), `FRAME_FILTER_METHOD`. Stage A standalone adds `OUTPUT_FOLDER`, `REPORT`.
@@ -219,13 +219,10 @@ edit possible.
   explain that visible seams are an accepted cost of exact-data
   preservation.
 - [`mosaic.py`](mosaic.py:1) — module docstring updated to state that
-  only `v1` is registered. The helper functions
-  [`_feather_weights()`](mosaic.py:361),
-  [`mosaic_frames_feather()`](mosaic.py:383) and
-  [`mosaic_frames_histmatch_feather()`](mosaic.py:607) are intentionally
-  left in the file as unreachable dead code (no caller imports them
-  anymore) — the smallest-safe-change rule won out over a full delete,
-  and a future reviewer can drop them in a follow-up.
+  only `v1` is registered. The helper functions `_feather_weights()`,
+  `mosaic_frames_feather()` and `mosaic_frames_histmatch_feather()`
+  were initially left as unreachable dead code; they have since been
+  fully removed (see Phase P1 changelog 2026-05-07).
 - [`mosaic_algorithm.py`](mosaic_algorithm.py:1) — removed the
   `MAX_FEATHER_PX` parameter (UI knob and class constant), the
   feather-only `extra_kwargs` dispatch, and the v4/v5 mentions in the
@@ -246,3 +243,17 @@ edit possible.
   ignore the now-unknown parameter / fall back to index 0 — both are
   acceptable degradations.
 - Verification: `python3 -m py_compile methods.py mosaic.py mosaic_algorithm.py hyperspectral_algorithm.py pipeline.py` succeeded; project-wide regex sweep for `MAX_FEATHER_PX|max_feather_pixels|mosaic_frames_feather|mosaic_frames_histmatch|v4_feather|v5_histmatch` finds matches only inside [`mosaic.py`](mosaic.py:1) (the unreachable helpers), confirming no other importer / registration site references the removed paths.
+
+## Changelog — 2026-05-07 Phase P1 — Quality wins
+
+- **Gap-fill default reordered.** [`methods.GAP_FILL_METHODS`](methods.py:1) now lists `v3_gdal_fillnodata` first (default in QGIS dropdowns); `v2_idw_quadrants` moves to index 1. Spectral fidelity preferred over interpolated invention — the C backend is the same algorithm family as v2 but ~10–100× faster and is now the production default.
+- **New mosaic method `v2_best_pixel`** in [`mosaic.py`](mosaic.py:1) (registered as index 1 of [`MOSAIC_METHODS`](methods.py:88), labelled "v2 — Best pixel (max distance to edge) — recommended"): per output pixel picks the source frame with the maximum distance-to-edge (via [`scipy.ndimage.distance_transform_edt`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.ndimage.distance_transform_edt.html)); copies that source's full spectrum (all bands) into the output, so spectral fidelity is preserved (no mixing). Ties resolved by input order. Optionally writes `<output>.sources.tif` (uint16 provenance raster, `0` = nodata, `1..N` = 1-based frame index). [`v1_first_write_wins`](mosaic.py:1) remains index 0 for backward compatibility with saved Model Builder graphs.
+- **Dead feather code removed** from [`mosaic.py`](mosaic.py:1): `_feather_weights`, `mosaic_frames_feather` and `mosaic_frames_histmatch_feather` (left as unreachable dead code by the 2026-05-06 visual-mosaic removal) are now fully deleted. The "Project policy — data correctness over visual appearance" section above remains the source of truth for why no feather/histmatch path can be re-introduced as a registered method.
+- **Mosaic-quality metrics extended** in [`mosaic_quality.compare_rasters()`](mosaic_quality.py:1): added `coverage_ratio`, `filled_pixel_ratio`, `nodata_fraction_per_band`, plus `*_filled_only` and `*_overlap_only` per-band statistical variants (lets users see how the mosaic performs on the filled-vs-original-vs-overlap regions separately). Fillmask-dependent metrics gracefully return `None` when `<output>.fillmask.tif` is absent (e.g. dry-run or external mosaic). New optional `output_path` kwarg on [`compare_rasters()`](mosaic_quality.py:1) so the helper can locate the side outputs.
+- **New provenance analyzer** [`mosaic_quality.analyze_sources()`](mosaic_quality.py:1) (`output_path`, `frame_paths=None`): consumes `<output>.sources.tif` written by `v2_best_pixel`. Returns `n_sources`, `source_contribution_stats` (per-source pixel-share), and optional `source_filenames` when `frame_paths` is supplied. `overlap_ratio` is intentionally `None` (true overlap cannot be reconstructed from winner-only provenance — documented inline so a future reviewer doesn't try to "fix" it). Wired into the [`mosaic_quality_algorithm.py`](mosaic_quality_algorithm.py:1) report.
+
+**Side outputs convention (current):**
+- `<output>.mosaic.tif` — intermediate Stage B mosaic (deleted at end of pipeline run).
+- `<output>.fillmask.tif` — interior-only fill mask (uint8, 0/1) used by Stage C; consumed by `mosaic_quality` `*_filled_only` metrics.
+- `<output>.sources.tif` — uint16 provenance raster written by `v2_best_pixel` (0 = nodata, 1..N = 1-based frame index); consumed by [`mosaic_quality.analyze_sources()`](mosaic_quality.py:1).
+- `<output>.rejected.csv` — Stage A audit (`path, reason, measured_value, threshold`); a deliverable, not a temp file.

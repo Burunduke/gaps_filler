@@ -98,6 +98,20 @@ MOSAIC_METHODS = [
         ),
         "func": mosaic.mosaic_frames,
     },
+    {
+        "id": "v2_best_pixel",
+        "label": "v2 — Best pixel (max distance to edge) — recommended",
+        "tooltip": (
+            "For each output pixel covered by ≥1 input frame, pick the source "
+            "whose pixel is farthest from any nodata edge (most 'interior' pixel). "
+            "Copy that source's full spectrum (all bands) into the output. "
+            "Ties resolved by input order. "
+            "Limit: computationally more expensive than v1; writes an optional "
+            "sources provenance raster (<output>.sources.tif) to track which "
+            "input frame contributed each pixel."
+        ),
+        "func": mosaic.mosaic_frames_best_pixel,
+    },
 ]
 
 
@@ -105,24 +119,11 @@ MOSAIC_METHODS = [
 # Stage C — Gap filling
 # ---------------------------------------------------------------------------
 
+
 GAP_FILL_METHODS = [
     {
-        "id": "v2_idw_quadrants",
-        "label": "v2 — IDW with quadrant sweeps (default)",
-        "tooltip": (
-            "Default for production. Good for small-to-medium mosaics "
-            "with gaps <= 100 px. "
-            "Limit: slow — if Stage C runtime hurts, switch to v3 "
-            "(same algorithm, C speed). For gaps > max_search_dist the "
-            "pixel stays NaN by design."
-        ),
-        # gaps_filler_algorithm dispatches at file level; fill_nodata_file
-        # forwards to the array-level fill_nodata internally.
-        "func": fill_nodata.fill_nodata_file,
-    },
-    {
         "id": "v3_gdal_fillnodata",
-        "label": "v3 — gdal.FillNodata (C-speed)",
+        "label": "v3 — gdal.FillNodata (C-speed) (default)",
         "tooltip": (
             "Use when Stage C runtime hurts and the algorithm is good "
             "enough (it's the same family as v2). "
@@ -134,8 +135,21 @@ GAP_FILL_METHODS = [
         # raises (Pipeline TO-DO #7 in hyperspectral_plan.md).
         "func": fill_nodata.fill_nodata_file_gdal,
     },
+    {
+        "id": "v2_idw_quadrants",
+        "label": "v2 — IDW with quadrant sweeps",
+        "tooltip": (
+            "Good for small-to-medium mosaics "
+            "with gaps <= 100 px. "
+            "Limit: slow — if Stage C runtime hurts, switch to v3 "
+            "(same algorithm, C speed). For gaps > max_search_dist the "
+            "pixel stays NaN by design."
+        ),
+        # gaps_filler_algorithm dispatches at file level; fill_nodata_file
+        # forwards to the array-level fill_nodata internally.
+        "func": fill_nodata.fill_nodata_file,
+    },
 ]
-
 
 def labels(registry):
     """Return the list of UI labels for an enum parameter."""

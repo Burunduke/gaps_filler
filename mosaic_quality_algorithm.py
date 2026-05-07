@@ -24,6 +24,7 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
 
     REFERENCE = "REFERENCE"
     MOSAIC = "MOSAIC"
+    OUTPUT_PATH = "OUTPUT_PATH"
 
     # Output keys. For each band-level metric we expose three aggregates
     # in the documented order MEAN / WORST / P05. WORST = max for
@@ -116,6 +117,13 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
                 self.MOSAIC, self.tr("Built mosaic")
             )
         )
+        # Optional output path for fillmask-based metrics
+        self.addParameter(
+            QgsProcessingParameterRasterLayer(
+                self.OUTPUT_PATH, self.tr("Output mosaic (for fillmask metrics)"),
+                optional=True
+            )
+        )
         # Band-level metric aggregates: MEAN / WORST / WORST_BAND / P05 /
         # P05_BAND. The *_BAND outputs are 1-based band indices (ints);
         # QgsProcessingOutputNumber accepts ints fine, and there is no
@@ -177,6 +185,16 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
             self.OUT_SAM, self.tr("SAM, radians (lower is better)")))
         self.addOutput(QgsProcessingOutputNumber(
             self.OUT_SAM_DEG, self.tr("SAM, degrees (lower is better)")))
+        
+        # New metrics
+        self.addOutput(QgsProcessingOutputNumber(
+            "COVERAGE_RATIO", self.tr("Coverage ratio (fraction of valid pixels)")))
+        self.addOutput(QgsProcessingOutputNumber(
+            "FILLED_PIXEL_RATIO", self.tr("Filled pixel ratio (fraction of valid pixels that were filled)")))
+        
+        # We won't add nodata_fraction_per_band as an output since it's a list
+        # We also won't add the filled_only and overlap_only metrics as outputs
+        # to keep the interface simple, but they're available in the detailed report
 
     # ---- Execution ---------------------------------------------------------
 
@@ -192,16 +210,21 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
         if mos_layer is None:
             raise QgsProcessingException(
                 self.invalidRasterError(parameters, self.MOSAIC))
+                
+        # Optional output path for fillmask metrics
+        output_layer = self.parameterAsRasterLayer(
+            parameters, self.OUTPUT_PATH, context)
 
         ref_path = ref_layer.source()
         mos_path = mos_layer.source()
+        output_path = output_layer.source() if output_layer is not None else None
 
         feedback.pushInfo("Reference: {}".format(ref_path))
         feedback.pushInfo("Mosaic:    {}".format(mos_path))
 
         try:
             summary = mosaic_quality.compare_rasters(
-                ref_path, mos_path, feedback=feedback)
+                ref_path, mos_path, feedback=feedback, output_path=output_path)
         except (ValueError, IOError) as exc:
             raise QgsProcessingException(str(exc))
         except RuntimeError as exc:
@@ -216,7 +239,31 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
                         "(no overlapping non-nodata pixels)."))
 
         # Pretty per-band table + aggregates + SAM.
-        feedback.pushInfo("\n" + mosaic_quality.format_report(summary))
+        report = mosaic_quality.format_report(summary)
+        
+        # Add source contribution analysis if output_path is provided
+        if output_path is not None:
+            sources_result = mosaic_quality.analyze_sources(output_path)
+            if sources_result["sources_available"]:
+                report += "\n\nSource contribution:"
+                report += "\n  Number of sources: {}".format(sources_result["n_sources"])
+                if sources_result["overlap_ratio"] is not None:
+                    report += "\n  Overlap ratio: {:.4f}".format(sources_result["overlap_ratio"])
+                else:
+                    report += "\n  Overlap ratio: N/A (cannot compute from sources raster alone)"
+                
+                # Add source contribution stats
+                report += "\n  Source contributions:"
+                for source_idx, fraction in sorted(sources_result["source_contribution_stats"].items()):
+                    line = "    Source {}: {:.2%}".format(source_idx, fraction)
+                    # Add filename if available
+                    if "source_filenames" in sources_result and source_idx <= len(sources_result["source_filenames"]):
+                        line += " ({})".format(sources_result["source_filenames"][source_idx-1])
+                    report += "\n" + line
+            else:
+                report += "\n\nSource contribution: No sources.tif found — provenance metrics unavailable."
+        
+        feedback.pushInfo("\n" + report)
 
         return {
             self.OUT_MEAN_RMSE: float(summary["mean_rmse"]),
@@ -241,4 +288,6 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
             self.OUT_P05_SSIM_BAND: int(summary["p05_ssim_band"]),
             self.OUT_SAM: float(summary["sam"]),
             self.OUT_SAM_DEG: float(summary["sam_deg"]),
+            "COVERAGE_RATIO": float(summary["coverage_ratio"]) if summary["coverage_ratio"] is not None else None,
+            "FILLED_PIXEL_RATIO": float(summary["filled_pixel_ratio"]) if summary["filled_pixel_ratio"] is not None else None,
         }

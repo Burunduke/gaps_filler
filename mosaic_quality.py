@@ -61,6 +61,121 @@ def _open(path):
     return ds
 
 
+def _load_fillmask(mosaic_path):
+    """Try to load <mosaic_path>.fillmask.tif, return None if absent.
+    
+    Returns numpy array or None. Logs warning if shapes don't match.
+    """
+    import os
+    import logging
+    
+    fillmask_path = mosaic_path + ".fillmask.tif"
+    if not os.path.exists(fillmask_path):
+        logging.warning("Fillmask not found: {}".format(fillmask_path))
+        return None
+    
+    try:
+        fillmask_ds = gdal.Open(fillmask_path, gdal.GA_ReadOnly)
+        if fillmask_ds is None:
+            logging.warning("Cannot open fillmask: {}".format(fillmask_path))
+            return None
+            
+        # Check shape compatibility
+        mosaic_ds = _open(mosaic_path)
+        if (fillmask_ds.RasterXSize != mosaic_ds.RasterXSize or
+            fillmask_ds.RasterYSize != mosaic_ds.RasterYSize):
+            logging.warning("Fillmask shape mismatch: {} vs {}".format(
+                (fillmask_ds.RasterYSize, fillmask_ds.RasterXSize),
+                (mosaic_ds.RasterYSize, mosaic_ds.RasterXSize)))
+            return None
+            
+        fillmask_arr = fillmask_ds.ReadAsArray()
+        return fillmask_arr
+    except Exception as e:
+        logging.warning("Error loading fillmask: {}".format(str(e)))
+        return None
+
+
+def analyze_sources(output_path, frame_paths=None):
+    """Analyze the sources raster to compute provenance-based metrics.
+    
+    Parameters
+    ----------
+    output_path : str
+        Path to the mosaic output file
+    frame_paths : list[str], optional
+        List of input frame paths for human-readable reporting
+        
+    Returns
+    -------
+    dict
+        Dictionary with provenance metrics or {"sources_available": False} if sources.tif is missing
+    """
+    import os
+    import logging
+    import numpy as np
+    import rasterio
+    
+    # Derive sources raster path
+    sources_path = output_path + ".sources.tif"
+    
+    # Try to load sources raster
+    if not os.path.exists(sources_path):
+        logging.warning("Sources raster not found: {}".format(sources_path))
+        return {"sources_available": False}
+    
+    try:
+        with rasterio.open(sources_path) as src:
+            # Read the sources array (uint16)
+            sources_arr = src.read(1)
+            
+            # Create mask for valid (non-zero) sources
+            valid_mask = sources_arr != 0
+            valid_sources = sources_arr[valid_mask]
+            
+            # Count distinct nonzero source indices
+            unique_sources = np.unique(valid_sources)
+            n_sources = len(unique_sources)
+            
+            # Compute source contribution stats using np.bincount
+            # bincount returns counts for indices 0..max, we want only nonzero indices
+            counts = np.bincount(valid_sources)
+            total_valid_pixels = np.sum(counts[1:])  # exclude index 0 (nodata)
+            
+            # Convert to fractions
+            source_contribution_stats = {}
+            for source_idx in unique_sources:
+                if source_idx > 0:  # skip nodata
+                    fraction = counts[source_idx] / total_valid_pixels
+                    source_contribution_stats[int(source_idx)] = float(fraction)
+            
+            # overlap_ratio is None because we can't reconstruct true overlap
+            # from sources.tif alone - it only records the winner, not all contributors
+            result = {
+                "sources_available": True,
+                "n_sources": int(n_sources),
+                "overlap_ratio": None,  # Cannot compute true overlap from sources raster alone
+                "source_contribution_stats": source_contribution_stats
+            }
+            
+            # Add source filenames if provided
+            if frame_paths is not None:
+                source_filenames = []
+                # Align with indices 1..N for human-readable reporting
+                for i in range(1, len(frame_paths) + 1):
+                    if i <= len(frame_paths):
+                        source_filenames.append(os.path.basename(frame_paths[i-1]))
+                    else:
+                        source_filenames.append("unknown_source_{}".format(i))
+                result["source_filenames"] = source_filenames
+            
+            return result
+            
+    except Exception as e:
+        logging.warning("Error loading sources raster: {}".format(str(e)))
+        return {"sources_available": False}
+
+
 def _mosaic_bounds(mos):
     """Return (minX, minY, maxX, maxY) in mosaic CRS units.
 
@@ -216,7 +331,7 @@ def _aggregate_band_metric(values, key, bands=None):
 # ---------------------------------------------------------------------------
 
 
-def compare_rasters(reference_path, mosaic_path, feedback=None):
+def compare_rasters(reference_path, mosaic_path, feedback=None, output_path=None):
     """Compute per-band RMSE / MAE / PSNR / SSIM plus aggregates and SAM.
 
     Parameters
@@ -228,6 +343,9 @@ def compare_rasters(reference_path, mosaic_path, feedback=None):
     feedback : optional duck-typed ``QgsProcessingFeedback``
         Used for ``pushInfo`` / ``pushWarning`` / ``reportError``.
         May be ``None`` outside QGIS.
+    output_path : optional str
+        Path to the final output mosaic (used to locate fillmask).
+        If provided, enables fillmask-based metrics.
 
     Returns
     -------
@@ -258,6 +376,13 @@ def compare_rasters(reference_path, mosaic_path, feedback=None):
     ref_src = _open(reference_path)
     mos = _open(mosaic_path)
 
+    # Load fillmask if output_path is provided
+    fillmask = None
+    if output_path is not None:
+        fillmask = _load_fillmask(output_path)
+        if fillmask is None and feedback is not None:
+            feedback.pushWarning("Fillmask not available; filled-only metrics will be None")
+
     # Align reference to the mosaic's grid so the two arrays are guaranteed
     # to have identical shape. The mosaic is the smaller raster (uneven
     # edges, possibly partial coverage); we keep it as-is and warp the
@@ -287,6 +412,10 @@ def compare_rasters(reference_path, mosaic_path, feedback=None):
     sam_p_sq = np.zeros((H, W), dtype=np.float64)
     sam_q_sq = np.zeros((H, W), dtype=np.float64)
     sam_valid_all = np.ones((H, W), dtype=bool)
+    
+    # Initialize storage for filled-only and overlap-only metrics
+    filled_only_metrics = {key: [] for key in ("rmse", "mae", "psnr", "ssim")}
+    overlap_only_metrics = {key: [] for key in ("rmse", "mae", "psnr", "ssim")}
 
     for b in range(1, band_count + 1):
         if feedback is not None:
@@ -349,24 +478,132 @@ def compare_rasters(reference_path, mosaic_path, feedback=None):
         else:
             psnr = 20.0 * math.log10(data_range) - 10.0 * math.log10(mse)
 
-        # SSIM needs 2D arrays. Set invalid pixels to a shared constant
-        # in both images so they cancel and do not skew the structural
-        # comparison. Using the reference mean keeps the constant inside
-        # the data range.
-        fill = float(ref_valid.mean())
-        ref_for_ssim = np.where(valid, ref_f, fill).astype(np.float64)
-        mos_for_ssim = np.where(valid, mos_f, fill).astype(np.float64)
+        # SSIM: compute on valid pixels with constant fill for invalid ones
+        fill_value = float(ref_valid.mean())
+        ref_for_ssim = np.where(valid, ref_f, fill_value).astype(np.float64)
+        mos_for_ssim = np.where(valid, mos_f, fill_value).astype(np.float64)
         ssim_range = data_range if data_range > 0 else 1.0
         ssim_val = _ssim_or_raise(ref_for_ssim, mos_for_ssim, ssim_range)
 
-        per_band.append({
+        # Compute overlap-only metrics (valid in both reference and mosaic)
+        # The 'valid' mask already represents the intersection of valid pixels
+        # in both rasters, so we can use it directly
+        overlap_valid = valid
+        n_overlap = int(overlap_valid.sum())
+        
+        # Compute filled-only metrics if fillmask is available
+        filled_only_vals = {}
+        if fillmask is not None and fillmask.shape == (H, W):
+            filled_mask = fillmask == 1
+            filled_valid = valid & filled_mask  # Only valid pixels that are filled
+            n_filled = int(filled_valid.sum())
+            if n_filled > 0:
+                diff_filled = ref_f[filled_valid] - mos_f[filled_valid]
+                mse_filled = float(np.mean(diff_filled * diff_filled))
+                mae_filled = float(np.mean(np.abs(diff_filled)))
+                rmse_filled = math.sqrt(mse_filled)
+                
+                ref_filled_valid = ref_f[filled_valid]
+                data_range_filled = float(ref_filled_valid.max() - ref_filled_valid.min())
+                if mse_filled <= 0.0:
+                    psnr_filled = float("inf")
+                elif data_range_filled <= 0.0:
+                    psnr_filled = float("inf")
+                else:
+                    psnr_filled = 20.0 * math.log10(data_range_filled) - 10.0 * math.log10(mse_filled)
+                
+                fill_filled = float(ref_filled_valid.mean())
+                ref_for_ssim_filled = np.where(filled_valid, ref_f, fill_filled).astype(np.float64)
+                mos_for_ssim_filled = np.where(filled_valid, mos_f, fill_filled).astype(np.float64)
+                ssim_range_filled = data_range_filled if data_range_filled > 0 else 1.0
+                ssim_filled = _ssim_or_raise(ref_for_ssim_filled, mos_for_ssim_filled, ssim_range_filled)
+                
+                filled_only_vals = {
+                    "rmse": rmse_filled,
+                    "mae": mae_filled,
+                    "psnr": psnr_filled,
+                    "ssim": ssim_filled,
+                }
+                # Store for aggregate calculation
+                for key in ("rmse", "mae", "psnr", "ssim"):
+                    filled_only_metrics[key].append(filled_only_vals[key])
+            else:
+                # No filled pixels, set metrics to None
+                filled_only_vals = {
+                    "rmse": None,
+                    "mae": None,
+                    "psnr": None,
+                    "ssim": None,
+                }
+        else:
+            # No fillmask, set metrics to None
+            filled_only_vals = {
+                "rmse": None,
+                "mae": None,
+                "psnr": None,
+                "ssim": None,
+            }
+        
+        # Compute overlap-only metrics
+        overlap_only_vals = {}
+        if n_overlap > 0:
+            diff_overlap = ref_f[overlap_valid] - mos_f[overlap_valid]
+            mse_overlap = float(np.mean(diff_overlap * diff_overlap))
+            mae_overlap = float(np.mean(np.abs(diff_overlap)))
+            rmse_overlap = math.sqrt(mse_overlap)
+            
+            ref_overlap_valid = ref_f[overlap_valid]
+            data_range_overlap = float(ref_overlap_valid.max() - ref_overlap_valid.min())
+            if mse_overlap <= 0.0:
+                psnr_overlap = float("inf")
+            elif data_range_overlap <= 0.0:
+                psnr_overlap = float("inf")
+            else:
+                psnr_overlap = 20.0 * math.log10(data_range_overlap) - 10.0 * math.log10(mse_overlap)
+            
+            fill_overlap = float(ref_overlap_valid.mean())
+            ref_for_ssim_overlap = np.where(overlap_valid, ref_f, fill_overlap).astype(np.float64)
+            mos_for_ssim_overlap = np.where(overlap_valid, mos_f, fill_overlap).astype(np.float64)
+            ssim_range_overlap = data_range_overlap if data_range_overlap > 0 else 1.0
+            ssim_overlap = _ssim_or_raise(ref_for_ssim_overlap, mos_for_ssim_overlap, ssim_range_overlap)
+            
+            overlap_only_vals = {
+                "rmse": rmse_overlap,
+                "mae": mae_overlap,
+                "psnr": psnr_overlap,
+                "ssim": ssim_overlap,
+            }
+            # Store for aggregate calculation
+            for key in ("rmse", "mae", "psnr", "ssim"):
+                overlap_only_metrics[key].append(overlap_only_vals[key])
+        else:
+            # No overlapping pixels, set metrics to None
+            overlap_only_vals = {
+                "rmse": None,
+                "mae": None,
+                "psnr": None,
+                "ssim": None,
+            }
+        
+        # Store regular metrics
+        band_metrics = {
             "band": b,
             "rmse": rmse,
             "mae": mae,
             "psnr": psnr,
             "ssim": ssim_val,
             "valid_pixels": n,
-        })
+        }
+        
+        # Add filled-only metrics to band metrics
+        for key in ("rmse", "mae", "psnr", "ssim"):
+            band_metrics[key + "_filled_only"] = filled_only_vals[key]
+            
+        # Add overlap-only metrics to band metrics
+        for key in ("rmse", "mae", "psnr", "ssim"):
+            band_metrics[key + "_overlap_only"] = overlap_only_vals[key]
+        
+        per_band.append(band_metrics)
 
     # ----- Per-band aggregates (mean / worst / p05) ------------------------
     summary = {
@@ -374,9 +611,47 @@ def compare_rasters(reference_path, mosaic_path, feedback=None):
         "per_band": per_band,
         "skipped_bands": skipped,
     }
+    
+    # ----- Compute overall validity mask for the mosaic ---------------------
+    # Read the mosaic once to determine which pixels are valid (non-nodata)
+    H, W = mos.RasterYSize, mos.RasterXSize
+    mosaic_valid_any = np.zeros((H, W), dtype=bool)
+    nodata_fraction_per_band = []
+    
+    for b in range(1, band_count + 1):
+        mb = mos.GetRasterBand(b)
+        mos_arr = mb.ReadAsArray()
+        mos_nd = mb.GetNoDataValue()
+        band_valid = ~_nodata_mask(mos_arr, mos_nd) & np.isfinite(mos_arr)
+        mosaic_valid_any |= band_valid
+        nodata_fraction_per_band.append(float((~band_valid).sum() / (H * W)))
+        
+    # We need to compute overlap-only metrics in the per-band loop
+    # Let's initialize storage for them
+    
+    total_pixels = H * W
+    valid_pixels = int(mosaic_valid_any.sum())
+    coverage_ratio = float(valid_pixels / total_pixels) if total_pixels > 0 else 0.0
+    
+    # Add basic metrics to summary
+    summary["coverage_ratio"] = coverage_ratio
+    summary["nodata_fraction_per_band"] = nodata_fraction_per_band
+    
+    # ----- Compute fillmask-based metrics -----------------------------------
+    if fillmask is not None and fillmask.shape == (H, W):
+        # 1 = filled pixel, 0 = original / nodata (based on fill_nodata.py)
+        filled_pixels = fillmask == 1
+        valid_and_filled = mosaic_valid_any & filled_pixels
+        filled_pixel_count = int(valid_and_filled.sum())
+        filled_pixel_ratio = float(filled_pixel_count / valid_pixels) if valid_pixels > 0 else 0.0
+        summary["filled_pixel_ratio"] = filled_pixel_ratio
+    else:
+        summary["filled_pixel_ratio"] = None
+    
     # Parallel list of 1-based band indices for the values above; this
     # matters when some bands were skipped (so list-position != band #).
     band_idxs = [m["band"] for m in per_band]
+    
     for key in ("rmse", "mae", "psnr", "ssim"):
         vals = [m[key] for m in per_band]
         mean_v, worst_v, p05_v, worst_b, p05_b = _aggregate_band_metric(
@@ -386,6 +661,42 @@ def compare_rasters(reference_path, mosaic_path, feedback=None):
         summary["p05_" + key] = p05_v
         summary["worst_" + key + "_band"] = worst_b
         summary["p05_" + key + "_band"] = p05_b
+    
+    # Add filled-only aggregate metrics if we have data
+    for key in ("rmse", "mae", "psnr", "ssim"):
+        if filled_only_metrics[key]:  # Only if we have data
+            mean_v, worst_v, p05_v, worst_b, p05_b = _aggregate_band_metric(
+                filled_only_metrics[key], key, bands=band_idxs[:len(filled_only_metrics[key])])
+            summary["mean_" + key + "_filled_only"] = mean_v
+            summary["worst_" + key + "_filled_only"] = worst_v
+            summary["p05_" + key + "_filled_only"] = p05_v
+            summary["worst_" + key + "_filled_only_band"] = worst_b
+            summary["p05_" + key + "_filled_only_band"] = p05_b
+        else:
+            # No data, set to None
+            summary["mean_" + key + "_filled_only"] = None
+            summary["worst_" + key + "_filled_only"] = None
+            summary["p05_" + key + "_filled_only"] = None
+            summary["worst_" + key + "_filled_only_band"] = 0
+            summary["p05_" + key + "_filled_only_band"] = 0
+    
+    # Add overlap-only aggregate metrics
+    for key in ("rmse", "mae", "psnr", "ssim"):
+        if overlap_only_metrics[key]:  # Only if we have data
+            mean_v, worst_v, p05_v, worst_b, p05_b = _aggregate_band_metric(
+                overlap_only_metrics[key], key, bands=band_idxs[:len(overlap_only_metrics[key])])
+            summary["mean_" + key + "_overlap_only"] = mean_v
+            summary["worst_" + key + "_overlap_only"] = worst_v
+            summary["p05_" + key + "_overlap_only"] = p05_v
+            summary["worst_" + key + "_overlap_only_band"] = worst_b
+            summary["p05_" + key + "_overlap_only_band"] = p05_b
+        else:
+            # No data, set to None
+            summary["mean_" + key + "_overlap_only"] = None
+            summary["worst_" + key + "_overlap_only"] = None
+            summary["p05_" + key + "_overlap_only"] = None
+            summary["worst_" + key + "_overlap_only_band"] = 0
+            summary["p05_" + key + "_overlap_only_band"] = 0
 
     # ----- Whole-cube SAM --------------------------------------------------
     # angle(p, q) = arccos( clip( dot(p, q) / (||p|| * ||q|| + eps),
@@ -475,4 +786,22 @@ def format_report(summary):
     lines.append("SAM     (rad) : {:.6f}   [{} pixels valid in every band]"
                  .format(summary["sam"], summary["sam_valid_pixels"]))
     lines.append("SAM_DEG (deg) : {:.6f}".format(summary["sam_deg"]))
+    
+    # Add new metrics
+    lines.append(
+        "-----+------------+------------+------------+------------+-----------")
+    lines.append("Coverage ratio : {:.6f}   [fraction of valid pixels in mosaic]"
+                 .format(summary["coverage_ratio"] if summary["coverage_ratio"] is not None else float('nan')))
+    
+    if summary["filled_pixel_ratio"] is not None:
+        lines.append("Filled pixel ratio : {:.6f}   [fraction of valid pixels that were gap-filled]"
+                     .format(summary["filled_pixel_ratio"]))
+    else:
+        lines.append("Filled pixel ratio : N/A   [fillmask not available]")
+    
+    # Add nodata fraction per band as a separate line
+    if "nodata_fraction_per_band" in summary and summary["nodata_fraction_per_band"]:
+        lines.append("NoData fraction per band : {}".format(
+            ", ".join(["{:.4f}".format(f) for f in summary["nodata_fraction_per_band"]])))
+    
     return "\n".join(lines)
