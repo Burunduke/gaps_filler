@@ -1,2 +1,4 @@
 gdal/
 *.pyc
+example/
+.DS_store
