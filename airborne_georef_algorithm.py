@@ -20,6 +20,7 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterDestination,
     QgsProcessingParameterRasterLayer,
+    QgsProcessingParameterVectorDestination,
 )
 
 from .src import airborne_georef, models
