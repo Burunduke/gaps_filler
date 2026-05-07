@@ -1,4 +1,4 @@
 gdal/
 *.pyc
-example/
+*.bil
 .DS_store

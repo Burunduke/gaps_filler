@@ -67,20 +67,18 @@ def _erode4(a):
 
 
 def write_interior_fill_mask(input_path: str, mask_path: str,
-                             max_gap_px: int = 0) -> None:
-    """Write a 0/1 uint8 mask co-registered with ``input_path``.
+                             max_gap_px: int = 0,
+                             three_state: bool = True) -> None:
+    """Write a uint8 mask co-registered with ``input_path``.
 
-    The mask is **0 only on fillable holes** and **1 everywhere else**
-    (valid pixels and outside-footprint pixels). This single polarity
-    works for both gap-fill backends:
+    When ``three_state=True`` (default), the mask has three states:
+      * 0 = original (valid pixels that were not filled)
+      * 1 = filled (interior holes that were filled)
+      * 2 = outside (outside-footprint pixels that remain nodata)
 
-      * v2 :func:`fill_nodata_file` reads ``mask != 0`` as the validity
-        mask and only fills pixels where ``mask == 0`` (it preserves the
-        original value -- NaN at outside-footprint -- where ``mask != 0``).
-      * v3 :func:`fill_nodata_file_gdal` forwards the mask to
-        :func:`osgeo.gdal.FillNodata` whose ``maskBand`` follows the same
-        convention: pixels with ``mask != 0`` are sources and never
-        modified; pixels with ``mask == 0`` are the targets to fill.
+    When ``three_state=False`` (legacy behaviour), the mask is binary:
+      * 0 = fillable holes (interior only)
+      * 1 = valid pixels and outside-footprint pixels
 
     Parameters
     ----------
@@ -100,6 +98,10 @@ def write_interior_fill_mask(input_path: str, mask_path: str,
         ``N`` iterations of erosion (4-connected) on the validity mask
         and unions the result with the topological fill, so gaps up to
         roughly ``2N`` pixels wide are bridged.
+    three_state : bool, default True
+        When True, write a 3-state mask (0=original, 1=filled, 2=outside).
+        When False, write a 2-state mask (0=fillable, 1=not-fillable)
+        for backward compatibility with legacy behaviour.
 
     ``rasterio`` and ``scipy`` are imported lazily so this module's
     top-level import surface stays numpy-only (matches the historical
@@ -161,9 +163,152 @@ def write_interior_fill_mask(input_path: str, mask_path: str,
     else:
         fill_region = filled & invalid
 
-    mask = (~fill_region).astype(np.uint8)
+    if three_state:
+        # Create 3-state mask:
+        # 0 = original (valid pixels)
+        # 1 = filled (interior holes)
+        # 2 = outside (outside-footprint pixels)
+        mask = np.zeros((H, W), dtype=np.uint8)
+        mask[fill_region] = 1  # filled interior holes
+        mask[invalid & ~fill_region] = 2  # outside-footprint pixels
+        band_description = "0=original, 1=filled, 2=outside"
+    else:
+        # Create 2-state mask (legacy behaviour):
+        # 0 = fillable holes (interior only)
+        # 1 = valid pixels and outside-footprint pixels
+        mask = (~fill_region).astype(np.uint8)
+        band_description = "0=fillable, 1=not-fillable"
+    
+    # Add band description for QGIS
+    profile["nodata"] = None  # No nodata value for this mask
+    
     with rasterio.open(mask_path, "w", **profile) as dst:
         dst.write(mask, 1)
+        # Add band description
+        dst.set_band_description(1, band_description)
+
+
+def compute_gap_region_metrics(fillmask_path):
+    """Compute gap region metrics from a 3-state fillmask.
+    
+    Parameters
+    ----------
+    fillmask_path : str
+        Path to the 3-state fillmask GeoTIFF (0=original, 1=filled, 2=outside)
+    
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+        - n_gap_regions: int, number of distinct connected gap regions
+        - largest_gap_px: int, size of largest gap region in pixels
+        - largest_gap_area_m2: float, area of largest gap in square meters (None if geotransform unavailable)
+    """
+    import rasterio
+    import numpy as np
+    
+    # Read the fillmask
+    with rasterio.open(fillmask_path) as src:
+        fillmask = src.read(1)
+        transform = src.transform
+    
+    # Extract gap regions (pixels with value 1)
+    gap_mask = fillmask == 1
+    
+    # If no gaps, return zeros
+    if not np.any(gap_mask):
+        return {
+            "n_gap_regions": 0,
+            "largest_gap_px": 0,
+            "largest_gap_area_m2": 0.0
+        }
+    
+    # Compute connected components
+    try:
+        from scipy.ndimage import label
+        # 4-connectivity structure
+        structure = np.array([[0, 1, 0],
+                                   [1, 1, 1],
+                                   [0, 1, 0]], dtype=int)
+        labeled_array, n_regions = label(gap_mask, structure=structure)
+    except ImportError:
+        # Fallback implementation using simple BFS
+        labeled_array, n_regions = _label_components_4conn(gap_mask)
+    
+    # Compute region sizes
+    if n_regions > 0:
+        # Count pixels in each region
+        region_sizes = np.bincount(labeled_array.ravel())[1:]  # Skip background (0)
+        largest_gap_px = int(np.max(region_sizes)) if len(region_sizes) > 0 else 0
+    else:
+        largest_gap_px = 0
+    
+    # Compute area in square meters if geotransform is available
+    largest_gap_area_m2 = None
+    if transform is not None:
+        # Pixel size from geotransform
+        pixel_w = abs(transform[0])  # x resolution
+        pixel_h = abs(transform[4])  # y resolution (usually negative)
+        
+        # Only compute area if both pixel dimensions are non-zero
+        if pixel_w > 0 and pixel_h > 0:
+            largest_gap_area_m2 = float(pixel_w * pixel_h * largest_gap_px)
+    
+    return {
+        "n_gap_regions": int(n_regions),
+        "largest_gap_px": int(largest_gap_px),
+        "largest_gap_area_m2": largest_gap_area_m2
+    }
+
+
+def _label_components_4conn(binary_mask):
+    """Label connected components with 4-connectivity using BFS.
+    
+    Parameters
+    ----------
+    binary_mask : np.ndarray
+        Binary mask where True indicates foreground pixels
+    
+    Returns
+    -------
+    labeled_array : np.ndarray
+        Array with same shape as binary_mask, with each connected component
+        labeled with a unique integer (0 = background)
+    n_components : int
+        Number of connected components found
+    """
+    import numpy as np
+    from collections import deque
+    
+    H, W = binary_mask.shape
+    labeled = np.zeros((H, W), dtype=np.int32)
+    current_label = 0
+    
+    # 4-connectivity offsets (up, down, left, right)
+    offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    
+    for i in range(H):
+        for j in range(W):
+            # If this is a foreground pixel and not yet labeled
+            if binary_mask[i, j] and labeled[i, j] == 0:
+                current_label += 1
+                # BFS to label all connected pixels
+                queue = deque([(i, j)])
+                labeled[i, j] = current_label
+                
+                while queue:
+                    y, x = queue.popleft()
+                    # Check 4-connected neighbors
+                    for dy, dx in offsets:
+                        ny, nx = y + dy, x + dx
+                        # Bounds check
+                        if 0 <= ny < H and 0 <= nx < W:
+                            # If neighbor is foreground and not labeled
+                            if binary_mask[ny, nx] and labeled[ny, nx] == 0:
+                                labeled[ny, nx] = current_label
+                                queue.append((ny, nx))
+    
+    return labeled, current_label
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +694,9 @@ def _fill_band_worker(input_path, b, mask_path,
             raise IOError("Cannot open mask {}".format(mask_path))
         marr = msrc.GetRasterBand(1).ReadAsArray()
         msrc = None
-        mask = marr != 0
+        # For 3-state mask: 0=original, 1=filled, 2=outside
+        # We want to fill only pixels with value 1 (interior holes)
+        mask = marr != 1
 
     if int(tile_size) > 0:
         # Tiled path: keep IO bounded inside the worker by reusing
@@ -658,7 +805,13 @@ def fill_nodata_file(input_path, output_path,
             raise ValueError("mask shape {} does not match raster {}"
                              .format(marr.shape,
                                      (src.RasterYSize, src.RasterXSize)))
-        mask = marr != 0
+        # For 3-state mask: 0=original, 1=filled, 2=outside
+        # We want to fill only pixels with value 1 (interior holes)
+        # For 2-state mask: 0=fillable, 1=not-fillable
+        # We want to fill only pixels with value 0 (fillable holes)
+        #
+        # Since we always generate 3-state masks now, we check for value 1
+        mask = marr != 1
 
     if feedback is not None:
         feedback.pushInfo("Creating output GeoTIFF: {}".format(output_path))
@@ -892,6 +1045,7 @@ def fill_nodata_file_gdal(input_path, output_path,
     # directly, so we keep the dataset alive for the whole loop.
     mask_band = None
     mask_ds = None
+    temp_mask_ds = None  # For 3-state to 2-state conversion
     if mask_path:
         if feedback is not None:
             feedback.pushInfo("Reading mask: {}".format(mask_path))
@@ -904,7 +1058,37 @@ def fill_nodata_file_gdal(input_path, output_path,
                 "mask size {}x{} does not match raster {}x{}".format(
                     mask_ds.RasterXSize, mask_ds.RasterYSize,
                     src.RasterXSize, src.RasterYSize))
-        mask_band = mask_ds.GetRasterBand(1)
+        
+        # Check if this is a 3-state mask (0=original, 1=filled, 2=outside)
+        # If so, we need to convert it to a 2-state mask for GDAL
+        # (0=fillable, non-zero=not-fillable)
+        mask_band_orig = mask_ds.GetRasterBand(1)
+        mask_stats = mask_band_orig.GetStatistics(True, True)
+        max_val = mask_stats[1]  # maximum value
+        
+        if max_val > 1:
+            # This is a 3-state mask, convert it to 2-state for GDAL
+            if feedback is not None:
+                feedback.pushInfo("Converting 3-state mask to 2-state for GDAL")
+            
+            # Create a temporary in-memory dataset for the converted mask
+            driver = gdal.GetDriverByName('MEM')
+            temp_mask_ds = driver.Create('', src.RasterXSize, src.RasterYSize, 1, gdal.GDT_Byte)
+            temp_mask_band = temp_mask_ds.GetRasterBand(1)
+            
+            # Read the original mask and convert it
+            orig_mask = mask_band_orig.ReadAsArray()
+            # For GDAL: 0=fillable, non-zero=not-fillable
+            # 0 (original) -> 1 (don't fill)
+            # 1 (filled) -> 0 (do fill)
+            # 2 (outside) -> 1 (don't fill)
+            converted_mask = np.where(orig_mask == 1, 0, 1).astype(np.uint8)
+            temp_mask_band.WriteArray(converted_mask)
+            
+            mask_band = temp_mask_band
+        else:
+            # This is already a 2-state mask, use it directly
+            mask_band = mask_band_orig
 
     if feedback is not None:
         feedback.pushInfo("Creating output GeoTIFF: {}".format(output_path))
@@ -955,6 +1139,7 @@ def fill_nodata_file_gdal(input_path, output_path,
         dst = None
         src = None
         mask_ds = None
+        temp_mask_ds = None  # Clean up temporary dataset
         raise
     except Exception as exc:
         # Per the plan ("keep v2 as the default fallback when GDAL is
@@ -966,6 +1151,7 @@ def fill_nodata_file_gdal(input_path, output_path,
         dst = None
         src = None
         mask_ds = None
+        temp_mask_ds = None  # Clean up temporary dataset
         return fill_nodata_file(
             input_path, output_path,
             mask_path=mask_path,
@@ -978,6 +1164,7 @@ def fill_nodata_file_gdal(input_path, output_path,
     dst = None
     src = None
     mask_ds = None
+    temp_mask_ds = None  # This will close the temporary dataset
 
     if feedback is not None:
         feedback.setProgress(100)

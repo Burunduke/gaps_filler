@@ -27,6 +27,22 @@ except ImportError:
     def enu2geodetic(e, n, u, lat0, lon0, h0, ell=None, deg=True):
         raise ImportError("pymap3d is required for georeferencing. Install with: pip install pymap3d")
 
+# Import for vector writing
+try:
+    from osgeo import ogr, osr
+except ImportError:
+    # Fallback if osgeo is not available
+    ogr = None
+    osr = None
+
+# Import for shapely simplification (optional)
+try:
+    from shapely.geometry import Polygon
+    from shapely import simplify
+    SHAPELY_AVAILABLE = True
+except ImportError:
+    SHAPELY_AVAILABLE = False
+
 
 @dataclass(frozen=True)
 class LcfTable:
@@ -114,10 +130,12 @@ def read_times(times_path: Path | str, expected_lines: int | None = None) -> Fra
     return FrameTimes(time=time_data)
 
 
-def interpolate_poses(lcf: LcfTable, times: FrameTimes) -> FramePoses:
+def interpolate_poses(lcf: LcfTable, times: FrameTimes, time_offset_s: float = 0.0) -> FramePoses:
     """Align time bases by subtracting each file's first timestamp (RELATIVE alignment),
     then np.interp each lcf field at the per-frame relative time.
     For yaw/heading use np.unwrap on lcf.yaw before interp (so wrap-around is handled).
+    
+    time_offset_s: Time offset in seconds to add to image timestamps before pose interpolation.
     """
     # Check monotonicity of time arrays
     if not np.all(np.diff(lcf.time) >= 0):
@@ -127,7 +145,9 @@ def interpolate_poses(lcf: LcfTable, times: FrameTimes) -> FramePoses:
     
     # Convert to relative time
     t_lcf_rel = lcf.time - lcf.time[0]
-    t_frame_rel = times.time - times.time[0]
+    # Apply time offset to frame times before converting to relative time
+    t_frame_abs = times.time + time_offset_s
+    t_frame_rel = t_frame_abs - times.time[0]
     
     # Check for time overlap
     max_lcf_rel = t_lcf_rel.max()
@@ -152,9 +172,12 @@ def interpolate_poses(lcf: LcfTable, times: FrameTimes) -> FramePoses:
                       roll=roll_interp, pitch=pitch_interp, yaw=yaw_interp)
 
 
-def load_flight_line_poses(meta: FlightLineMeta) -> FramePoses:
+def load_flight_line_poses(meta: FlightLineMeta, time_offset_s: float = 0.0) -> FramePoses:
     """Convenience: parses .lcf, .times, validates length against ENVI header, returns FramePoses.
-    Raises ValueError if meta.times or meta.lcf is None."""
+    Raises ValueError if meta.times or meta.lcf is None.
+    
+    time_offset_s: Time offset in seconds to add to image timestamps before pose interpolation.
+    """
     # Check that required files exist
     if meta.times is None:
         raise ValueError("TIMES file is required but not found")
@@ -168,8 +191,8 @@ def load_flight_line_poses(meta: FlightLineMeta) -> FramePoses:
     lcf = read_lcf(meta.lcf)
     times = read_times(meta.times, expected_lines=hdr.lines)
     
-    # Interpolate poses
-    return interpolate_poses(lcf, times)
+    # Interpolate poses with time offset
+    return interpolate_poses(lcf, times, time_offset_s=time_offset_s)
 
 
 def sample_view_angles(sensor: PushbroomSensor) -> np.ndarray:
@@ -202,6 +225,9 @@ def flat_ground_grid(
     poses: FramePoses,
     sensor: PushbroomSensor,
     ground_alt: float,
+    boresight_roll_deg: float = 0.0,
+    boresight_pitch_deg: float = 0.0,
+    boresight_yaw_deg: float = 0.0,
 ) -> GroundGrid:
     """Intersect each raw pixel ray with a flat plane at ground_alt.
     Uses per-frame lon/lat/alt/roll/pitch/yaw and sensor cross-track angles.
@@ -230,6 +256,13 @@ def flat_ground_grid(
     - Convert ENU offset to geodetic for each line/sample with `pymap3d.enu2geodetic(east, north, up, lat0, lon0, h0)`.
       - Use aircraft line pose as origin (`lat0=poses.lat[line]`, `lon0=poses.lon[line]`, `h0=poses.alt[line]`).
       - Vectorize per line over all samples; loop over lines is fine for readability.
+    
+    Boresight convention: Boresight is a small fixed rotation of the camera frame relative
+    to the IMU body frame, applied as Z-Y-X intrinsic Euler (yaw → pitch → roll),
+    right-handed, degrees, with the convention: positive roll = right wing down,
+    positive pitch = nose up, positive yaw = nose right (clockwise from above).
+    At each frame, the effective camera attitude in the local ENU frame is
+    R_enu_from_camera = R_enu_from_imu(t) · R_imu_from_camera(boresight).
     
     Important caveats to document in docstrings/comments:
     - FOV is a required parameter because PIKA-L can have different lenses.
@@ -298,6 +331,22 @@ def flat_ground_grid(
         Rx = rotation_x(roll)
         R = Rz @ Ry @ Rx
         
+        # Apply boresight rotation if specified
+        # Convert boresight angles from degrees to radians
+        if boresight_roll_deg != 0.0 or boresight_pitch_deg != 0.0 or boresight_yaw_deg != 0.0:
+            boresight_roll_rad = np.radians(boresight_roll_deg)
+            boresight_pitch_rad = np.radians(boresight_pitch_deg)
+            boresight_yaw_rad = np.radians(boresight_yaw_deg)
+            
+            # Create boresight rotation matrix: R_b = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+            Rz_b = rotation_z(boresight_yaw_rad)
+            Ry_b = rotation_y(boresight_pitch_rad)
+            Rx_b = rotation_x(boresight_roll_rad)
+            R_b = Rz_b @ Ry_b @ Rx_b
+            
+            # Apply boresight rotation: R_enu_from_camera = R_enu_from_imu * R_imu_from_camera
+            R = R @ R_b
+        
         # Vectorize computation for all samples in this line
         # Create rays in body coordinates for all samples
         # ray_body = [0, sin(angle), -cos(angle)] for each angle
@@ -362,6 +411,194 @@ def flat_ground_grid(
     return GroundGrid(lon=lon_grid, lat=lat_grid, alt=alt_grid, valid=valid_grid)
 
 
+def extract_footprint_polygon(grid: GroundGrid, simplify_tolerance: float = 0.0) -> list[tuple[float, float]]:
+    """Extract the footprint polygon from a GroundGrid.
+    
+    Takes the outer boundary of the projected grid:
+    - Top edge (frame 0, all across-track samples)
+    - Right edge (all frames, last across-track sample)
+    - Bottom edge (last frame, all across-track samples reversed)
+    - Left edge (all frames reversed, first across-track sample)
+    
+    Args:
+        grid: GroundGrid with lon/lat/valid arrays
+        simplify_tolerance: Simplification tolerance in degrees (0 = no simplification)
+        
+    Returns:
+        List of (lon, lat) tuples forming a closed ring
+    """
+    lines, samples = grid.lon.shape
+    
+    if lines < 2 or samples < 2:
+        raise ValueError("Grid must be at least 2x2")
+    
+    # Extract valid coordinates
+    valid_lon = grid.lon[grid.valid]
+    valid_lat = grid.lat[grid.valid]
+    
+    if len(valid_lon) == 0:
+        raise ValueError("No valid points in grid")
+    
+    # Build the outer ring
+    ring_points = []
+    
+    # Top edge: frame 0, all across-track samples
+    for s in range(samples):
+        if grid.valid[0, s]:
+            ring_points.append((grid.lon[0, s], grid.lat[0, s]))
+    
+    # Right edge: all frames, last across-track sample
+    for l in range(lines):
+        if grid.valid[l, samples-1]:
+            ring_points.append((grid.lon[l, samples-1], grid.lat[l, samples-1]))
+    
+    # Bottom edge: last frame, all across-track samples (reversed)
+    for s in range(samples-1, -1, -1):
+        if grid.valid[lines-1, s]:
+            ring_points.append((grid.lon[lines-1, s], grid.lat[lines-1, s]))
+    
+    # Left edge: all frames (reversed), first across-track sample
+    for l in range(lines-1, -1, -1):
+        if grid.valid[l, 0]:
+            ring_points.append((grid.lon[l, 0], grid.lat[l, 0]))
+    
+    # Close the ring by adding the first point again
+    if ring_points:
+        ring_points.append(ring_points[0])
+    
+    # Simplify if requested and shapely is available
+    if simplify_tolerance > 0 and SHAPELY_AVAILABLE and len(ring_points) > 3:
+        try:
+            polygon = Polygon(ring_points)
+            simplified = simplify(polygon, tolerance=simplify_tolerance)
+            if simplified.exterior:
+                # Convert back to list of tuples
+                simplified_points = list(simplified.exterior.coords)
+                return simplified_points
+        except Exception:
+            # If simplification fails, return original points
+            pass
+    
+    return ring_points
+
+
+def write_footprint_vector(
+    grid: GroundGrid,
+    footprint_path: str | Path,
+    dst_crs: str = "EPSG:4326",
+    flight_line_name: str = "",
+    simplify_tolerance: float = 0.0
+) -> None:
+    """Write the footprint polygon as a vector file.
+    
+    Args:
+        grid: GroundGrid with lon/lat/valid arrays
+        footprint_path: Path to write the vector file to
+        dst_crs: Destination CRS (default EPSG:4326)
+        flight_line_name: Name of the flight line for attributes
+        simplify_tolerance: Simplification tolerance (0 = no simplification)
+    """
+    if ogr is None:
+        raise ImportError("osgeo.ogr is required to write vector files")
+    
+    # Extract the footprint polygon ring
+    ring_points = extract_footprint_polygon(grid, simplify_tolerance)
+    
+    if len(ring_points) < 3:
+        raise ValueError("Footprint polygon must have at least 3 points")
+    
+    # Determine driver from file extension
+    path_str = str(footprint_path).lower()
+    if path_str.endswith('.gpkg'):
+        driver_name = 'GPKG'
+    elif path_str.endswith('.shp'):
+        driver_name = 'ESRI Shapefile'
+    else:  # Default to GeoJSON
+        driver_name = 'GeoJSON'
+    
+    # Create the vector file
+    driver = ogr.GetDriverByName(driver_name)
+    if driver is None:
+        raise RuntimeError(f"OGR driver '{driver_name}' not available")
+    
+    # Remove existing file if it exists
+    import os
+    if os.path.exists(footprint_path):
+        driver.DeleteDataSource(footprint_path)
+    
+    # Create data source
+    datasource = driver.CreateDataSource(str(footprint_path))
+    if datasource is None:
+        raise RuntimeError(f"Failed to create datasource at {footprint_path}")
+    
+    # Create layer
+    layer_name = Path(footprint_path).stem
+    layer = datasource.CreateLayer(layer_name, geom_type=ogr.wkbPolygon)
+    if layer is None:
+        datasource.Destroy()
+        raise RuntimeError("Failed to create layer")
+    
+    # Add fields
+    field_defn = ogr.FieldDefn("flight_line", ogr.OFTString)
+    field_defn.SetWidth(255)
+    layer.CreateField(field_defn)
+    
+    field_defn = ogr.FieldDefn("n_frames", ogr.OFTInteger)
+    layer.CreateField(field_defn)
+    
+    field_defn = ogr.FieldDefn("n_xtrack", ogr.OFTInteger)
+    layer.CreateField(field_defn)
+    
+    # Add mean_alt_m field if altitude data is available
+    field_defn = ogr.FieldDefn("mean_alt_m", ogr.OFTReal)
+    layer.CreateField(field_defn)
+    
+    # Create feature
+    feature = ogr.Feature(layer.GetLayerDefn())
+    
+    # Set attributes
+    feature.SetField("flight_line", flight_line_name)
+    feature.SetField("n_frames", grid.lon.shape[0])
+    feature.SetField("n_xtrack", grid.lon.shape[1])
+    
+    # Calculate mean altitude if all alt values are the same (flat grid)
+    if np.all(grid.alt == grid.alt[0, 0]):
+        feature.SetField("mean_alt_m", float(grid.alt[0, 0]))
+    # For DEM grids, we could calculate mean, but for now we'll leave it unset
+    
+    # Create polygon geometry
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+    for lon, lat in ring_points:
+        ring.AddPoint(lon, lat)
+    
+    polygon = ogr.Geometry(ogr.wkbPolygon)
+    polygon.AddGeometry(ring)
+    
+    # Set CRS
+    spatial_ref = osr.SpatialReference()
+    spatial_ref.SetFromUserInput("EPSG:4326")
+    polygon.AssignSpatialReference(spatial_ref)
+    
+    # Transform to output CRS if needed
+    if dst_crs != "EPSG:4326":
+        output_ref = osr.SpatialReference()
+        output_ref.SetFromUserInput(dst_crs)
+        transform = osr.CoordinateTransformation(spatial_ref, output_ref)
+        polygon.Transform(transform)
+    
+    feature.SetGeometry(polygon)
+    
+    # Create feature in layer
+    if layer.CreateFeature(feature) != 0:
+        feature.Destroy()
+        datasource.Destroy()
+        raise RuntimeError("Failed to create feature")
+    
+    # Cleanup
+    feature.Destroy()
+    datasource.Destroy()
+
+
 @dataclass(frozen=True)
 class GeorefResult:
     """Summary of a written flat-earth georeferenced GeoTIFF."""
@@ -382,6 +619,11 @@ def write_flat_geotiff(
     dst_crs: str = "EPSG:4326",
     resolution: float | None = None,
     nodata: float | int | None = None,
+    boresight_roll_deg: float = 0.0,
+    boresight_pitch_deg: float = 0.0,
+    boresight_yaw_deg: float = 0.0,
+    time_offset_s: float = 0.0,
+    footprint_path: str | Path | None = None,
 ) -> GeorefResult:
     """Write a flat-earth georeferenced GeoTIFF from a PIKA-L raw cube.
 
@@ -392,6 +634,24 @@ def write_flat_geotiff(
     
     When dem_path is None, uses flat_ground_grid with constant ground_alt.
     When dem_path is provided, uses dem_ground_grid with ground_alt as fallback.
+    
+    Boresight convention: Boresight is a small fixed rotation of the camera frame relative
+    to the IMU body frame, applied as Z-Y-X intrinsic Euler (yaw → pitch → roll),
+    right-handed, degrees, with the convention: positive roll = right wing down,
+    positive pitch = nose up, positive yaw = nose right (clockwise from above).
+    At each frame, the effective camera attitude in the local ENU frame is
+    R_enu_from_camera = R_enu_from_imu(t) · R_imu_from_camera(boresight).
+    
+    Time offset convention: time_offset_s is added to the image-frame timestamp
+    before looking up the IMU/GPS pose: t_lookup = t_image + time_offset_s.
+    Positive value means the images were stamped earlier than GPS, so we shift
+    forward to align.
+    
+    LCF angles are in radians per Resonon spec; we convert boresight from degrees
+    to radians before composing.
+    
+    footprint_path: Optional path to write the footprint polygon as a vector file.
+    Format is inferred from extension (.geojson, .gpkg, .shp). When None, no footprint is written.
     """
     # Validate raw cube exists FIRST before doing expensive operations
     if not meta.bil.exists():
@@ -410,17 +670,23 @@ def write_flat_geotiff(
     # Read header
     header = read_envi_header(meta.hdr)
     
-    # Load poses
-    poses = load_flight_line_poses(meta)
+    # Load poses with time offset
+    poses = load_flight_line_poses(meta, time_offset_s=time_offset_s)
     
     # Build sensor and grid
     sensor = PushbroomSensor(samples=header.samples, fov_deg=fov_deg)
     
     # Use either flat or DEM-aware grid generation
     if dem_path is None:
-        grid = flat_ground_grid(poses, sensor, ground_alt=ground_alt)
+        grid = flat_ground_grid(poses, sensor, ground_alt=ground_alt,
+                                boresight_roll_deg=boresight_roll_deg,
+                                boresight_pitch_deg=boresight_pitch_deg,
+                                boresight_yaw_deg=boresight_yaw_deg)
     else:
-        grid = dem_ground_grid(poses, sensor, dem_path, fallback_ground_alt=ground_alt)
+        grid = dem_ground_grid(poses, sensor, dem_path, fallback_ground_alt=ground_alt,
+                                boresight_roll_deg=boresight_roll_deg,
+                                boresight_pitch_deg=boresight_pitch_deg,
+                                boresight_yaw_deg=boresight_yaw_deg)
     
     # Open cube with rasterio
     with rasterio.open(meta.bil) as src:
@@ -526,7 +792,31 @@ def write_flat_geotiff(
                     dst_crs=dst_crs,
                     resampling=Resampling.nearest,
                 )
-    
+     
+    # Write footprint vector file if requested
+    if footprint_path is not None:
+        # Use either flat or DEM-aware grid for footprint
+        if dem_path is None:
+            footprint_grid = flat_ground_grid(poses, sensor, ground_alt=ground_alt,
+                                            boresight_roll_deg=boresight_roll_deg,
+                                            boresight_pitch_deg=boresight_pitch_deg,
+                                            boresight_yaw_deg=boresight_yaw_deg)
+        else:
+            footprint_grid = dem_ground_grid(poses, sensor, dem_path, fallback_ground_alt=ground_alt,
+                                           boresight_roll_deg=boresight_roll_deg,
+                                           boresight_pitch_deg=boresight_pitch_deg,
+                                           boresight_yaw_deg=boresight_yaw_deg)
+        
+        # Write the footprint with a small simplification tolerance (half a pixel in degrees)
+        # For projected CRS, we'd need to convert to meters, but for now we'll use a small value
+        write_footprint_vector(
+            grid=footprint_grid,
+            footprint_path=footprint_path,
+            dst_crs=dst_crs,
+            flight_line_name=meta.name,
+            simplify_tolerance=0.00001  # Approximately half a pixel in degrees for typical resolution
+        )
+     
     # Return GeorefResult
     return GeorefResult(
         output_path=Path(output_path),
@@ -545,6 +835,9 @@ def dem_ground_grid(
     fallback_ground_alt: float,
     max_iterations: int = 8,
     tolerance_m: float = 0.25,
+    boresight_roll_deg: float = 0.0,
+    boresight_pitch_deg: float = 0.0,
+    boresight_yaw_deg: float = 0.0,
 ) -> GroundGrid:
     """Intersect each raw pixel ray with terrain from a DEM.
     
@@ -559,6 +852,9 @@ def dem_ground_grid(
     - fallback_ground_alt: Initial altitude estimate when DEM sample is invalid
     - max_iterations: Maximum number of iterations for ray/DEM intersection (default 8)
     - tolerance_m: Convergence tolerance in meters (default 0.25)
+    - boresight_roll_deg: Boresight roll angle in degrees (default 0.0)
+    - boresight_pitch_deg: Boresight pitch angle in degrees (default 0.0)
+    - boresight_yaw_deg: Boresight yaw angle in degrees (default 0.0)
     
     Returns:
     - GroundGrid with lon/lat/alt/valid arrays for each pixel
@@ -655,6 +951,22 @@ def dem_ground_grid(
             Ry = rotation_y(pitch)
             Rx = rotation_x(roll)
             R = Rz @ Ry @ Rx
+            
+            # Apply boresight rotation if specified
+            # Convert boresight angles from degrees to radians
+            if boresight_roll_deg != 0.0 or boresight_pitch_deg != 0.0 or boresight_yaw_deg != 0.0:
+                boresight_roll_rad = np.radians(boresight_roll_deg)
+                boresight_pitch_rad = np.radians(boresight_pitch_deg)
+                boresight_yaw_rad = np.radians(boresight_yaw_deg)
+                
+                # Create boresight rotation matrix: R_b = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+                Rz_b = rotation_z(boresight_yaw_rad)
+                Ry_b = rotation_y(boresight_pitch_rad)
+                Rx_b = rotation_x(boresight_roll_rad)
+                R_b = Rz_b @ Ry_b @ Rx_b
+                
+                # Apply boresight rotation: R_enu_from_camera = R_enu_from_imu * R_imu_from_camera
+                R = R @ R_b
             
             # Vectorize computation for all samples in this line
             # Create rays in body coordinates for all samples

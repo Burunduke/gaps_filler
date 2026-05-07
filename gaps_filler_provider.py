@@ -11,6 +11,7 @@ from .hyperspectral_algorithm import HyperspectralPipelineAlgorithm
 from .frame_filter_algorithm import FrameFilterAlgorithm
 from .mosaic_algorithm import MosaicAlgorithm
 from .mosaic_quality_algorithm import MosaicQualityAlgorithm
+from .airborne_georef_algorithm import AirborneGeorefAlgorithm
 
 
 class GapsFillerProvider(QgsProcessingProvider):
@@ -32,3 +33,4 @@ class GapsFillerProvider(QgsProcessingProvider):
         self.addAlgorithm(FrameFilterAlgorithm())
         self.addAlgorithm(MosaicAlgorithm())
         self.addAlgorithm(MosaicQualityAlgorithm())
+        self.addAlgorithm(AirborneGeorefAlgorithm())

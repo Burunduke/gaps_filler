@@ -83,7 +83,10 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
             "the v1 first-write-wins rule (spectrally faithful — every "
             "output pixel comes from exactly one source frame). All "
             "inputs must share CRS and pixel size (or enable "
-            "reprojection below)."
+            "reprojection below). "
+            "By default, two side outputs are also generated: "
+            "<output>.overlap_count.tif (number of input frames covering each pixel) "
+            "and <output>.valid_coverage.tif (binary mask of pixels covered by at least one frame)."
         )
 
     # ---- Parameters --------------------------------------------------------
@@ -110,6 +113,13 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
                 self.tr("Reproject mismatched frames to the first frame's "
                         "CRS / pixel size (instead of aborting)"),
                 defaultValue=False,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                "EMIT_COVERAGE_OUTPUTS",
+                self.tr("Emit coverage outputs (.overlap_count.tif and .valid_coverage.tif)"),
+                defaultValue=True,
             )
         )
         self.addParameter(
@@ -171,11 +181,19 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(
                 "Reprojection of mismatched frames is enabled.")
 
+        # Read coverage outputs parameter
+        emit_coverage_outputs = self.parameterAsBoolean(
+            parameters, "EMIT_COVERAGE_OUTPUTS", context)
+        if not emit_coverage_outputs:
+            feedback.pushInfo(
+                "Coverage outputs (.overlap_count.tif and .valid_coverage.tif) disabled.")
+
         try:
             method_entry["func"](
                 paths, out_path,
                 progress=cb,
                 reproject_to_first=reproject_to_first,
+                emit_coverage_outputs=emit_coverage_outputs,
             )
         except QgsProcessingException:
             raise

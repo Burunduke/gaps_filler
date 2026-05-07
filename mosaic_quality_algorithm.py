@@ -13,6 +13,7 @@ from qgis.core import (
     QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingOutputNumber,
+    QgsProcessingParameterFileDestination,
     QgsProcessingParameterRasterLayer,
 )
 
@@ -25,6 +26,8 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
     REFERENCE = "REFERENCE"
     MOSAIC = "MOSAIC"
     OUTPUT_PATH = "OUTPUT_PATH"
+    SOURCES_PATH = "SOURCES_PATH"
+    OUTPUT_REPORT_JSON = "OUTPUT_REPORT_JSON"
 
     # Output keys. For each band-level metric we expose three aggregates
     # in the documented order MEAN / WORST / P05. WORST = max for
@@ -124,6 +127,20 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
                 optional=True
             )
         )
+        # Optional sources raster for seam consistency metrics
+        self.addParameter(
+            QgsProcessingParameterRasterLayer(
+                self.SOURCES_PATH, self.tr("Sources raster (for seam consistency metrics)"),
+                optional=True
+            )
+        )
+        # Optional JSON report output
+        self.addParameter(
+            QgsProcessingParameterFileDestination(
+                self.OUTPUT_REPORT_JSON, self.tr("JSON report"),
+                self.tr("JSON files (*.json)"), optional=True
+            )
+        )
         # Band-level metric aggregates: MEAN / WORST / WORST_BAND / P05 /
         # P05_BAND. The *_BAND outputs are 1-based band indices (ints);
         # QgsProcessingOutputNumber accepts ints fine, and there is no
@@ -214,17 +231,33 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
         # Optional output path for fillmask metrics
         output_layer = self.parameterAsRasterLayer(
             parameters, self.OUTPUT_PATH, context)
+        
+        # Optional sources raster for seam consistency metrics
+        sources_layer = self.parameterAsRasterLayer(
+            parameters, self.SOURCES_PATH, context)
+        
+        # Optional JSON report output path
+        json_output_path = self.parameterAsFileOutput(
+            parameters, self.OUTPUT_REPORT_JSON, context)
 
         ref_path = ref_layer.source()
         mos_path = mos_layer.source()
         output_path = output_layer.source() if output_layer is not None else None
-
+        sources_path = sources_layer.source() if sources_layer is not None else None
+        
+        # Log output paths
         feedback.pushInfo("Reference: {}".format(ref_path))
         feedback.pushInfo("Mosaic:    {}".format(mos_path))
+        if output_path:
+            feedback.pushInfo("Output:    {}".format(output_path))
+        if sources_path:
+            feedback.pushInfo("Sources:   {}".format(sources_path))
+        if json_output_path:
+            feedback.pushInfo("JSON report: {}".format(json_output_path))
 
         try:
             summary = mosaic_quality.compare_rasters(
-                ref_path, mos_path, feedback=feedback, output_path=output_path)
+                ref_path, mos_path, feedback=feedback, output_path=output_path, sources_path=sources_path)
         except (ValueError, IOError) as exc:
             raise QgsProcessingException(str(exc))
         except RuntimeError as exc:
@@ -263,6 +296,14 @@ class MosaicQualityAlgorithm(QgsProcessingAlgorithm):
             else:
                 report += "\n\nSource contribution: No sources.tif found — provenance metrics unavailable."
         
+        # Write JSON report if requested
+        if json_output_path:
+            try:
+                mosaic_quality.write_json_report(summary, json_output_path)
+                feedback.pushInfo("JSON report written to: {}".format(json_output_path))
+            except Exception as e:
+                feedback.pushWarning("Failed to write JSON report: {}".format(str(e)))
+
         feedback.pushInfo("\n" + report)
 
         return {

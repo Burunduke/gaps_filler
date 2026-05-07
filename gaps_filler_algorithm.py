@@ -279,6 +279,7 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
             fill_nodata.write_interior_fill_mask(
                 in_path, auto_mask_path,
                 max_gap_px=int(max_interior_gap_px),
+                three_state=True,
             )
             mask_path = auto_mask_path
         else:
@@ -295,6 +296,18 @@ class FillNoDataAlgorithm(QgsProcessingAlgorithm):
                 tile_size=int(tile_size),
                 n_workers=int(n_workers),
             )
+            
+            # Compute and report gap region metrics if we have a fill mask
+            if mask_path is not None and os.path.exists(mask_path):
+                try:
+                    gap_metrics = fill_nodata.compute_gap_region_metrics(mask_path)
+                    feedback.pushInfo("Gap region metrics:")
+                    feedback.pushInfo("  n_gap_regions: {}".format(gap_metrics["n_gap_regions"]))
+                    feedback.pushInfo("  largest_gap_px: {}".format(gap_metrics["largest_gap_px"]))
+                    if gap_metrics["largest_gap_area_m2"] is not None:
+                        feedback.pushInfo("  largest_gap_area_m2: {:.2f}".format(gap_metrics["largest_gap_area_m2"]))
+                except Exception as e:
+                    feedback.pushInfo("Warning: Failed to compute gap region metrics: {}".format(str(e)))
         except RuntimeError as exc:
             # fill_nodata raises RuntimeError("canceled") when feedback
             # reports cancellation. Translate to a clean Processing error.

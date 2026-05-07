@@ -112,6 +112,17 @@ MOSAIC_METHODS = [
         ),
         "func": mosaic.mosaic_frames_best_pixel,
     },
+    {
+        "id": "v3_vrt",
+        "label": "v3 — VRT-based mosaic (no blending; first-tile wins per pixel)",
+        "tooltip": (
+            "Use GDAL VRT to build a virtual mosaic, then translate to GeoTIFF. "
+            "Spectrally faithful — every output pixel comes from exactly one source frame, no mixing. "
+            "No blending or feathering. For overlap resolution, uses GDAL's default 'highest resolution' "
+            "rule with nearest neighbor resampling to preserve spectral values."
+        ),
+        "func": mosaic.mosaic_frames_vrt,
+    },
 ]
 
 

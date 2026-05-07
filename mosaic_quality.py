@@ -43,7 +43,10 @@ computed. After warping the two arrays share shape by construction, so
 the old "size mismatch" failure cannot occur.
 """
 
+import json
 import math
+from pathlib import Path
+from typing import Union
 
 import numpy as np
 from osgeo import gdal
@@ -267,6 +270,94 @@ def _ssim_or_raise(ref_valid_2d, mos_valid_2d, data_range):
     return float(ssim(ref_valid_2d, mos_valid_2d, data_range=data_range))
 
 
+def _json_sanitize(obj):
+    """Recursively convert non-JSON-serializable values to JSON-safe types.
+    
+    Handles:
+    - numpy scalars → Python scalars
+    - numpy arrays → lists
+    - Path objects → strings
+    - NaN/Inf → null
+    """
+    if isinstance(obj, (np.integer, np.floating)):
+        # Convert numpy scalars to Python types
+        val = obj.item()
+        # Handle NaN and Inf values
+        if isinstance(val, float):
+            if math.isnan(val) or math.isinf(val):
+                return None
+        return val
+    elif isinstance(obj, np.ndarray):
+        # Convert numpy arrays to lists
+        return [_json_sanitize(item) for item in obj.tolist()]
+    elif isinstance(obj, Path):
+        # Convert Path objects to strings
+        return str(obj)
+    elif isinstance(obj, dict):
+        # Recursively sanitize dictionary values
+        return {key: _json_sanitize(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        # Recursively sanitize list/tuple items
+        return [_json_sanitize(item) for item in obj]
+    else:
+        # For other types, try to convert to float if it's a number
+        # and handle NaN/Inf cases
+        if isinstance(obj, (int, float)):
+            if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+                return None
+        return obj
+
+
+def _label_components_4conn(binary_mask):
+    """Label connected components with 4-connectivity using BFS.
+    
+    Parameters
+    ----------
+    binary_mask : np.ndarray
+        Binary mask where True indicates foreground pixels
+    
+    Returns
+    -------
+    labeled_array : np.ndarray
+        Array with same shape as binary_mask, with each connected component
+        labeled with a unique integer (0 = background)
+    n_components : int
+        Number of connected components found
+    """
+    import numpy as np
+    from collections import deque
+    
+    H, W = binary_mask.shape
+    labeled = np.zeros((H, W), dtype=np.int32)
+    current_label = 0
+    
+    # 4-connectivity offsets (up, down, left, right)
+    offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    
+    for i in range(H):
+        for j in range(W):
+            # If this is a foreground pixel and not yet labeled
+            if binary_mask[i, j] and labeled[i, j] == 0:
+                current_label += 1
+                # BFS to label all connected pixels
+                queue = deque([(i, j)])
+                labeled[i, j] = current_label
+                
+                while queue:
+                    y, x = queue.popleft()
+                    # Check 4-connected neighbors
+                    for dy, dx in offsets:
+                        ny, nx = y + dy, x + dx
+                        # Bounds check
+                        if 0 <= ny < H and 0 <= nx < W:
+                            # If neighbor is foreground and not labeled
+                            if binary_mask[ny, nx] and labeled[ny, nx] == 0:
+                                labeled[ny, nx] = current_label
+                                queue.append((ny, nx))
+    
+    return labeled, current_label
+
+
 # ---------------------------------------------------------------------------
 # Aggregation helpers
 # ---------------------------------------------------------------------------
@@ -331,7 +422,7 @@ def _aggregate_band_metric(values, key, bands=None):
 # ---------------------------------------------------------------------------
 
 
-def compare_rasters(reference_path, mosaic_path, feedback=None, output_path=None):
+def compare_rasters(reference_path, mosaic_path, feedback=None, output_path=None, sources_path=None):
     """Compute per-band RMSE / MAE / PSNR / SSIM plus aggregates and SAM.
 
     Parameters
@@ -346,6 +437,9 @@ def compare_rasters(reference_path, mosaic_path, feedback=None, output_path=None
     output_path : optional str
         Path to the final output mosaic (used to locate fillmask).
         If provided, enables fillmask-based metrics.
+    sources_path : optional str
+        Path to the sources raster (used to compute seam consistency).
+        If provided, enables seam consistency metrics.
 
     Returns
     -------
@@ -382,6 +476,98 @@ def compare_rasters(reference_path, mosaic_path, feedback=None, output_path=None
         fillmask = _load_fillmask(output_path)
         if fillmask is None and feedback is not None:
             feedback.pushWarning("Fillmask not available; filled-only metrics will be None")
+    
+    # Compute gap region metrics if fillmask is available
+    gap_metrics = None
+    if output_path is not None and fillmask is not None:
+        try:
+            # Create a temporary fillmask file for the metrics computation
+            import tempfile
+            import rasterio
+            from pathlib import Path
+            
+            # Get the mosaic geotransform for area calculation
+            with rasterio.open(mosaic_path) as mos_src:
+                transform = mos_src.transform
+                profile = mos_src.profile.copy()
+            
+            # Create temporary fillmask file
+            temp_fillmask_path = None
+            try:
+                # Create a temporary file
+                temp_dir = Path(output_path).parent
+                temp_fillmask_path = str(temp_dir / "temp_fillmask_for_metrics.tif")
+                
+                # Write the fillmask to the temporary file with proper georeferencing
+                profile.update({
+                    'count': 1,
+                    'dtype': 'uint8',
+                    'compress': 'deflate'
+                })
+                
+                with rasterio.open(temp_fillmask_path, 'w', **profile) as dst:
+                    dst.write(fillmask, 1)
+                    dst.set_band_description(1, "0=original, 1=filled, 2=outside")
+                
+                # Compute gap metrics
+                gap_metrics = {
+                    "n_gap_regions": 0,
+                    "largest_gap_px": 0,
+                    "largest_gap_area_m2": 0.0
+                }
+                
+                # Extract gap regions (pixels with value 1)
+                gap_mask = fillmask == 1
+                
+                if gap_mask.any():
+                    # Compute connected components
+                    try:
+                        from scipy.ndimage import label
+                        # 4-connectivity structure
+                        structure = np.array([[0, 1, 0],
+                                             [1, 1, 1],
+                                             [0, 1, 0]], dtype=int)
+                        labeled_array, n_regions = label(gap_mask, structure=structure)
+                    except ImportError:
+                        # Fallback implementation using simple BFS
+                        labeled_array, n_regions = _label_components_4conn(gap_mask)
+                    
+                    # Compute region sizes
+                    if n_regions > 0:
+                        # Count pixels in each region
+                        region_sizes = np.bincount(labeled_array.ravel())[1:]  # Skip background (0)
+                        largest_gap_px = int(np.max(region_sizes)) if len(region_sizes) > 0 else 0
+                    else:
+                        largest_gap_px = 0
+                    
+                    # Compute area in square meters if geotransform is available
+                    largest_gap_area_m2 = None
+                    if transform is not None:
+                        # Pixel size from geotransform
+                        pixel_w = abs(transform[0])  # x resolution
+                        pixel_h = abs(transform[4])  # y resolution (usually negative)
+                        
+                        # Only compute area if both pixel dimensions are non-zero
+                        if pixel_w > 0 and pixel_h > 0:
+                            largest_gap_area_m2 = float(pixel_w * pixel_h * largest_gap_px)
+                    
+                    gap_metrics = {
+                        "n_gap_regions": int(n_regions),
+                        "largest_gap_px": int(largest_gap_px),
+                        "largest_gap_area_m2": largest_gap_area_m2
+                    }
+                
+            finally:
+                # Clean up temporary file
+                if temp_fillmask_path and os.path.exists(temp_fillmask_path):
+                    try:
+                        os.remove(temp_fillmask_path)
+                    except OSError:
+                        pass
+        except Exception as e:
+            if feedback is not None:
+                feedback.pushWarning("Failed to compute gap region metrics: {}".format(str(e)))
+            gap_metrics = None
 
     # Align reference to the mosaic's grid so the two arrays are guaranteed
     # to have identical shape. The mosaic is the smaller raster (uneven
@@ -639,7 +825,7 @@ def compare_rasters(reference_path, mosaic_path, feedback=None, output_path=None
     
     # ----- Compute fillmask-based metrics -----------------------------------
     if fillmask is not None and fillmask.shape == (H, W):
-        # 1 = filled pixel, 0 = original / nodata (based on fill_nodata.py)
+        # 1 = filled pixel, 0 = original, 2 = outside (based on fill_nodata.py)
         filled_pixels = fillmask == 1
         valid_and_filled = mosaic_valid_any & filled_pixels
         filled_pixel_count = int(valid_and_filled.sum())
@@ -722,7 +908,215 @@ def compare_rasters(reference_path, mosaic_path, feedback=None, output_path=None
         else float("nan")
     summary["sam_valid_pixels"] = n_sam
 
+    # ----- Seam consistency metrics ------------------------------------------
+    # Compute seam consistency if sources_path is provided
+    if sources_path is not None:
+        try:
+            seam_consistency = compute_seam_consistency(mosaic_path, sources_path)
+            summary["seam_consistency"] = seam_consistency
+        except Exception as e:
+            if feedback is not None:
+                feedback.pushWarning("Failed to compute seam consistency: {}".format(str(e)))
+            summary["seam_consistency"] = None
+    else:
+        summary["seam_consistency"] = None
+    
+    # Add gap region metrics if computed
+    if gap_metrics is not None:
+        summary["n_gap_regions"] = gap_metrics["n_gap_regions"]
+        summary["largest_gap_px"] = gap_metrics["largest_gap_px"]
+        summary["largest_gap_area_m2"] = gap_metrics["largest_gap_area_m2"]
+    else:
+        summary["n_gap_regions"] = None
+        summary["largest_gap_px"] = None
+        summary["largest_gap_area_m2"] = None
+
     return summary
+
+
+def compute_seam_consistency(mosaic_path: Union[str, Path], sources_path: Union[str, Path], sample_distance_px: int = 1) -> dict:
+    """Compute seam consistency metrics by quantifying radiometric jumps across mosaic seams.
+    
+    Seam pixels are identified as pixels whose 4-neighbor has a different (non-nodata) source id.
+    For each seam pixel pair (p, q) where sources[p] != sources[q], sample the mosaic at both
+    p and q (per band) and compute per-band statistics of the absolute difference |mosaic[p] - mosaic[q]|.
+    
+    Parameters
+    ----------
+    mosaic_path : str or Path
+        Path to the mosaic raster file
+    sources_path : str or Path
+        Path to the sources raster file (uint16/uint8 provenance raster)
+    sample_distance_px : int, optional
+        Distance in pixels for sampling adjacent pixels (default: 1)
+        
+    Returns
+    -------
+    dict
+        Dictionary with seam consistency metrics including:
+        - per_band: list of dicts with per-band statistics
+        - overall: dict with aggregate statistics across all bands
+        - seam_pixel_count: total number of seam pixels
+        - seam_length_px: total seam length in pixels
+    """
+    # Open the sources raster
+    sources_ds = gdal.Open(str(sources_path), gdal.GA_ReadOnly)
+    if sources_ds is None:
+        raise IOError("Cannot open sources raster: {}".format(sources_path))
+    
+    try:
+        # Read the sources array (typically uint16)
+        sources_arr = sources_ds.ReadAsArray()
+        sources_nodata = sources_ds.GetRasterBand(1).GetNoDataValue()
+        
+        # Identify seam pixels: pixels whose 4-neighbor has a different (non-nodata) source id
+        # Create masks for valid (non-nodata) sources
+        if sources_nodata is not None:
+            valid_sources = sources_arr != sources_nodata
+        else:
+            valid_sources = np.ones_like(sources_arr, dtype=bool)
+        
+        # Initialize seam mask
+        seam_mask = np.zeros_like(sources_arr, dtype=bool)
+        H, W = sources_arr.shape
+        
+        # Check 4-connectivity (up, down, left, right neighbors)
+        # Up neighbor
+        if H > 1:
+            valid_both = valid_sources[1:, :] & valid_sources[:-1, :]
+            different_sources = sources_arr[1:, :] != sources_arr[:-1, :]
+            seam_mask[1:, :] |= valid_both & different_sources
+            seam_mask[:-1, :] |= valid_both & different_sources
+            
+        # Left neighbor
+        if W > 1:
+            valid_both = valid_sources[:, 1:] & valid_sources[:, :-1]
+            different_sources = sources_arr[:, 1:] != sources_arr[:, :-1]
+            seam_mask[:, 1:] |= valid_both & different_sources
+            seam_mask[:, :-1] |= valid_both & different_sources
+        
+        # Count seam pixels
+        seam_pixel_count = int(seam_mask.sum())
+        seam_length_px = seam_pixel_count  # For 4-connectivity, each seam pixel contributes 1 to length
+        
+        # If no seams found, return empty metrics
+        if seam_pixel_count == 0:
+            return {
+                "per_band": [],
+                "overall": {
+                    "mean_abs_diff": 0.0,
+                    "median_abs_diff": 0.0,
+                    "p95_abs_diff": 0.0,
+                    "max_abs_diff": 0.0
+                },
+                "seam_pixel_count": 0,
+                "seam_length_px": 0
+            }
+        
+        # Open the mosaic raster
+        mosaic_ds = gdal.Open(str(mosaic_path), gdal.GA_ReadOnly)
+        if mosaic_ds is None:
+            raise IOError("Cannot open mosaic raster: {}".format(mosaic_path))
+            
+        band_count = mosaic_ds.RasterCount
+        
+        # Collect absolute differences for all bands
+        all_abs_diffs = []
+        per_band_stats = []
+        
+        # Process bands one at a time to manage memory
+        for b in range(1, band_count + 1):
+            mb = mosaic_ds.GetRasterBand(b)
+            mosaic_arr = mb.ReadAsArray()
+            mosaic_nodata = mb.GetNoDataValue()
+            
+            # Create validity mask for mosaic (finite values and not nodata)
+            mosaic_valid = np.isfinite(mosaic_arr)
+            if mosaic_nodata is not None:
+                if isinstance(mosaic_nodata, float) and math.isnan(mosaic_nodata):
+                    # NaN nodata is already handled by isfinite
+                    pass
+                else:
+                    mosaic_valid &= (mosaic_arr != mosaic_nodata)
+            
+            # Find seam pixel pairs where both pixels are valid in the mosaic
+            seam_and_valid = seam_mask & mosaic_valid
+            
+            # Collect absolute differences for this band
+            abs_diffs = []
+            
+            # Check up neighbor differences
+            if H > 1:
+                # Valid seam pixels and both pixels valid in mosaic
+                valid_seam_pairs = seam_and_valid[1:, :] & mosaic_valid[:-1, :]
+                if valid_seam_pairs.any():
+                    diff = np.abs(mosaic_arr[1:, :][valid_seam_pairs] - mosaic_arr[:-1, :][valid_seam_pairs])
+                    abs_diffs.extend(diff.tolist())
+            
+            # Check left neighbor differences
+            if W > 1:
+                # Valid seam pixels and both pixels valid in mosaic
+                valid_seam_pairs = seam_and_valid[:, 1:] & mosaic_valid[:, :-1]
+                if valid_seam_pairs.any():
+                    diff = np.abs(mosaic_arr[:, 1:][valid_seam_pairs] - mosaic_arr[:, :-1][valid_seam_pairs])
+                    abs_diffs.extend(diff.tolist())
+            
+            # Convert to numpy array
+            abs_diffs = np.array(abs_diffs)
+            
+            # Compute statistics for this band
+            if len(abs_diffs) > 0:
+                band_stats = {
+                    "band": b,
+                    "mean_abs_diff": float(np.mean(abs_diffs)),
+                    "median_abs_diff": float(np.median(abs_diffs)),
+                    "p95_abs_diff": float(np.percentile(abs_diffs, 95)),
+                    "max_abs_diff": float(np.max(abs_diffs)),
+                    "sample_count": len(abs_diffs)
+                }
+                all_abs_diffs.extend(abs_diffs)
+            else:
+                band_stats = {
+                    "band": b,
+                    "mean_abs_diff": 0.0,
+                    "median_abs_diff": 0.0,
+                    "p95_abs_diff": 0.0,
+                    "max_abs_diff": 0.0,
+                    "sample_count": 0
+                }
+            
+            per_band_stats.append(band_stats)
+        
+        # Compute overall statistics across all bands
+        all_abs_diffs = np.array(all_abs_diffs)
+        if len(all_abs_diffs) > 0:
+            overall_stats = {
+                "mean_abs_diff": float(np.mean(all_abs_diffs)),
+                "median_abs_diff": float(np.median(all_abs_diffs)),
+                "p95_abs_diff": float(np.percentile(all_abs_diffs, 95)),
+                "max_abs_diff": float(np.max(all_abs_diffs))
+            }
+        else:
+            overall_stats = {
+                "mean_abs_diff": 0.0,
+                "median_abs_diff": 0.0,
+                "p95_abs_diff": 0.0,
+                "max_abs_diff": 0.0
+            }
+        
+        return {
+            "per_band": per_band_stats,
+            "overall": overall_stats,
+            "seam_pixel_count": seam_pixel_count,
+            "seam_length_px": seam_length_px
+        }
+        
+    finally:
+        # Close datasets
+        if sources_ds is not None:
+            sources_ds = None
+        if mosaic_ds is not None:
+            mosaic_ds = None
 
 
 def format_report(summary):
@@ -804,4 +1198,218 @@ def format_report(summary):
         lines.append("NoData fraction per band : {}".format(
             ", ".join(["{:.4f}".format(f) for f in summary["nodata_fraction_per_band"]])))
     
+    # Add seam consistency metrics if available
+    if "seam_consistency" in summary and summary["seam_consistency"] is not None:
+        seam_metrics = summary["seam_consistency"]
+        lines.append(
+            "-----+------------+------------+------------+------------+-----------")
+        lines.append("Seam consistency metrics:")
+        lines.append("  Seam pixel count: {}".format(seam_metrics["seam_pixel_count"]))
+        lines.append("  Seam length (px): {}".format(seam_metrics["seam_length_px"]))
+        lines.append("  Overall mean abs diff: {:.6f}".format(seam_metrics["overall"]["mean_abs_diff"]))
+        lines.append("  Overall median abs diff: {:.6f}".format(seam_metrics["overall"]["median_abs_diff"]))
+        lines.append("  Overall p95 abs diff: {:.6f}".format(seam_metrics["overall"]["p95_abs_diff"]))
+        lines.append("  Overall max abs diff: {:.6f}".format(seam_metrics["overall"]["max_abs_diff"]))
+        
+        # Add per-band metrics for first few bands
+        if seam_metrics["per_band"]:
+            lines.append("  Per-band (first 5):")
+            for band_stats in seam_metrics["per_band"][:5]:
+                lines.append("    Band {}: mean={:.6f}, median={:.6f}, p95={:.6f}, max={:.6f}".format(
+                    band_stats["band"],
+                    band_stats["mean_abs_diff"],
+                    band_stats["median_abs_diff"],
+                    band_stats["p95_abs_diff"],
+                    band_stats["max_abs_diff"]
+                ))
+            if len(seam_metrics["per_band"]) > 5:
+                lines.append("    ... and {} more bands".format(len(seam_metrics["per_band"]) - 5))
+    
+    # Add gap region metrics if available
+    if "n_gap_regions" in summary and summary["n_gap_regions"] is not None:
+        lines.append(
+            "-----+------------+------------+------------+------------+-----------")
+        lines.append("Gap region metrics:")
+        lines.append("  Number of gap regions: {}".format(summary["n_gap_regions"]))
+        lines.append("  Largest gap (pixels): {}".format(summary["largest_gap_px"]))
+        if summary["largest_gap_area_m2"] is not None:
+            lines.append("  Largest gap (m²): {:.2f}".format(summary["largest_gap_area_m2"]))
+    
     return "\n".join(lines)
+
+
+def format_report_json(summary, indent=2):
+    """Format the mosaic quality comparison results as a JSON string.
+    
+    Parameters
+    ----------
+    summary : dict
+        The result dict from :func:`compare_rasters`.
+    indent : int, optional
+        JSON indentation level (default: 2).
+        
+    Returns
+    -------
+    str
+        JSON-formatted string with all metrics and metadata.
+    """
+    import datetime
+    
+    # Build the JSON structure with top-level keys mirroring the text report sections
+    report = {
+        # Global metrics (MEAN/WORST/P05 for each metric)
+        "global_metrics": {
+            "rmse": {
+                "mean": summary.get("mean_rmse"),
+                "worst": summary.get("worst_rmse"),
+                "worst_band": summary.get("worst_rmse_band"),
+                "p05": summary.get("p05_rmse"),
+                "p05_band": summary.get("p05_rmse_band")
+            },
+            "mae": {
+                "mean": summary.get("mean_mae"),
+                "worst": summary.get("worst_mae"),
+                "worst_band": summary.get("worst_mae_band"),
+                "p05": summary.get("p05_mae"),
+                "p05_band": summary.get("p05_mae_band")
+            },
+            "psnr": {
+                "mean": summary.get("mean_psnr"),
+                "worst": summary.get("worst_psnr"),
+                "worst_band": summary.get("worst_psnr_band"),
+                "p05": summary.get("p05_psnr"),
+                "p05_band": summary.get("p05_psnr_band")
+            },
+            "ssim": {
+                "mean": summary.get("mean_ssim"),
+                "worst": summary.get("worst_ssim"),
+                "worst_band": summary.get("worst_ssim_band"),
+                "p05": summary.get("p05_ssim"),
+                "p05_band": summary.get("p05_ssim_band")
+            }
+        },
+        
+        # Filled-only metrics
+        "filled_only_metrics": {
+            "rmse": {
+                "mean": summary.get("mean_rmse_filled_only"),
+                "worst": summary.get("worst_rmse_filled_only"),
+                "worst_band": summary.get("worst_rmse_filled_only_band"),
+                "p05": summary.get("p05_rmse_filled_only"),
+                "p05_band": summary.get("p05_rmse_filled_only_band")
+            },
+            "mae": {
+                "mean": summary.get("mean_mae_filled_only"),
+                "worst": summary.get("worst_mae_filled_only"),
+                "worst_band": summary.get("worst_mae_filled_only_band"),
+                "p05": summary.get("p05_mae_filled_only"),
+                "p05_band": summary.get("p05_mae_filled_only_band")
+            },
+            "psnr": {
+                "mean": summary.get("mean_psnr_filled_only"),
+                "worst": summary.get("worst_psnr_filled_only"),
+                "worst_band": summary.get("worst_psnr_filled_only_band"),
+                "p05": summary.get("p05_psnr_filled_only"),
+                "p05_band": summary.get("p05_psnr_filled_only_band")
+            },
+            "ssim": {
+                "mean": summary.get("mean_ssim_filled_only"),
+                "worst": summary.get("worst_ssim_filled_only"),
+                "worst_band": summary.get("worst_ssim_filled_only_band"),
+                "p05": summary.get("p05_ssim_filled_only"),
+                "p05_band": summary.get("p05_ssim_filled_only_band")
+            }
+        },
+        
+        # Overlap-only metrics
+        "overlap_only_metrics": {
+            "rmse": {
+                "mean": summary.get("mean_rmse_overlap_only"),
+                "worst": summary.get("worst_rmse_overlap_only"),
+                "worst_band": summary.get("worst_rmse_overlap_only_band"),
+                "p05": summary.get("p05_rmse_overlap_only"),
+                "p05_band": summary.get("p05_rmse_overlap_only_band")
+            },
+            "mae": {
+                "mean": summary.get("mean_mae_overlap_only"),
+                "worst": summary.get("worst_mae_overlap_only"),
+                "worst_band": summary.get("worst_mae_overlap_only_band"),
+                "p05": summary.get("p05_mae_overlap_only"),
+                "p05_band": summary.get("p05_mae_overlap_only_band")
+            },
+            "psnr": {
+                "mean": summary.get("mean_psnr_overlap_only"),
+                "worst": summary.get("worst_psnr_overlap_only"),
+                "worst_band": summary.get("worst_psnr_overlap_only_band"),
+                "p05": summary.get("p05_psnr_overlap_only"),
+                "p05_band": summary.get("p05_psnr_overlap_only_band")
+            },
+            "ssim": {
+                "mean": summary.get("mean_ssim_overlap_only"),
+                "worst": summary.get("worst_ssim_overlap_only"),
+                "worst_band": summary.get("worst_ssim_overlap_only_band"),
+                "p05": summary.get("p05_ssim_overlap_only"),
+                "p05_band": summary.get("p05_ssim_overlap_only_band")
+            }
+        },
+        
+        # Per-band metrics
+        "per_band": summary.get("per_band", []),
+        
+        # Coverage metrics
+        "coverage": {
+            "coverage_ratio": summary.get("coverage_ratio"),
+            "filled_pixel_ratio": summary.get("filled_pixel_ratio"),
+            "nodata_fraction_per_band": summary.get("nodata_fraction_per_band", [])
+        },
+        
+        # Provenance and metadata
+        "provenance": {
+            "band_count": summary.get("band_count"),
+            "skipped_bands": summary.get("skipped_bands", [])
+        },
+        
+        # Metadata
+        "meta": {
+            "timestamp": datetime.datetime.now().isoformat()
+        },
+        
+        # Seam consistency metrics
+        "seam_consistency": summary.get("seam_consistency"),
+        
+        # Gap region metrics
+        "gap_region_metrics": {
+            "n_gap_regions": summary.get("n_gap_regions"),
+            "largest_gap_px": summary.get("largest_gap_px"),
+            "largest_gap_area_m2": summary.get("largest_gap_area_m2")
+        }
+    }
+    
+    # Sanitize the report for JSON serialization
+    sanitized_report = _json_sanitize(report)
+    
+    # Return formatted JSON string
+    return json.dumps(sanitized_report, indent=indent, ensure_ascii=False)
+
+
+def write_json_report(summary, path):
+    """Write the mosaic quality comparison results as a JSON file.
+    
+    Parameters
+    ----------
+    summary : dict
+        The result dict from :func:`compare_rasters`.
+    path : str or Path
+        Output file path.
+    """
+    import datetime
+    from pathlib import Path
+    
+    # Format the JSON report
+    json_str = format_report_json(summary)
+    
+    # Write to file with UTF-8 encoding and ensure newline at EOF
+    path = Path(path)
+    with path.open('w', encoding='utf-8', newline='\n') as f:
+        f.write(json_str)
+

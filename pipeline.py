@@ -273,6 +273,7 @@ def run_pipeline(
             mosaic_path,
             progress=lambda f, m: cb(0.05 + 0.65 * f, "mosaic: " + m),
             reproject_to_first=reproject_to_first,
+            emit_coverage_outputs=True,  # Always emit coverage outputs in pipeline
         )
         # All-NaN-band guard (Pipeline TO-DO item #4): scan the Stage-B
         # mosaic on disk before invoking the file-level gap-fill callable.
@@ -297,6 +298,7 @@ def run_pipeline(
             fill_nodata.write_interior_fill_mask(
                 mosaic_path, fill_mask_path,
                 max_gap_px=int(max_interior_gap_px),
+                three_state=True,
             )
             log_cb("Footprint mask written to {}".format(fill_mask_path))
 
@@ -317,6 +319,24 @@ def run_pipeline(
             tile_size=int(tile_size),
             n_workers=int(n_workers),
         )
+        
+        # Compute gap region metrics if we have a fill mask
+        gap_metrics = None
+        if fill_mask_path is not None and os.path.exists(fill_mask_path):
+            try:
+                gap_metrics = fill_nodata.compute_gap_region_metrics(fill_mask_path)
+                log_cb("Gap region metrics: n_gap_regions={}, largest_gap_px={}".format(
+                    gap_metrics["n_gap_regions"], gap_metrics["largest_gap_px"]))
+                if gap_metrics["largest_gap_area_m2"] is not None:
+                    log_cb("Largest gap area: {:.2f} m²".format(gap_metrics["largest_gap_area_m2"]))
+            except Exception as e:
+                log_cb("Warning: Failed to compute gap region metrics: {}".format(str(e)))
+                gap_metrics = {
+                    "n_gap_regions": None,
+                    "largest_gap_px": None,
+                    "largest_gap_area_m2": None
+                }
+        
         cb(1.0, "fill: done")
     finally:
         # Best-effort temp cleanup (mosaic + footprint mask).
@@ -330,10 +350,16 @@ def run_pipeline(
             except OSError:
                 pass
 
-    return {
+    result = {
         "input_count": len(input_paths),
         "kept_count": len(good),
         "rejected": rejected,
         "output_path": output_path,
         "band_count": band_count,
     }
+    
+    # Add gap metrics to result if computed
+    if gap_metrics is not None:
+        result.update(gap_metrics)
+    
+    return result
