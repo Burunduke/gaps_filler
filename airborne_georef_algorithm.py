@@ -148,14 +148,19 @@ class AirborneGeorefAlgorithm(QgsProcessingAlgorithm):
             )
         )
         
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.GROUND_ALT,
-                self.tr("Ground altitude (meters, flat-earth mode)"),
-                type=Double,
-                defaultValue=50.0
-            )
+        ground_alt_param = QgsProcessingParameterNumber(
+            self.GROUND_ALT,
+            self.tr("Ground altitude (meters, flat-earth mode)"),
+            type=QgsProcessingParameterNumber.Double,
+            defaultValue=0.0
         )
+        ground_alt_param.setHelp(self.tr(
+            "Ground elevation in meters for flat-earth georeferencing. "
+            "If the ENVI header contains a 'ground elevation' field, its value will be displayed in the log. "
+            "Typical values: 0 for sea-level scenes, actual terrain elevation for mountainous areas. "
+            "Must be below aircraft altitude to produce valid geolocation points."
+        ))
+        self.addParameter(ground_alt_param)
         
         # Optional DEM for DEM-aware mode
         self.addParameter(
@@ -288,6 +293,26 @@ class AirborneGeorefAlgorithm(QgsProcessingAlgorithm):
         boresight_pitch_deg = self.parameterAsDouble(parameters, self.BORESIGHT_PITCH_DEG, context)
         boresight_yaw_deg = self.parameterAsDouble(parameters, self.BORESIGHT_YAW_DEG, context)
         time_offset_s = self.parameterAsDouble(parameters, self.TIME_OFFSET_S, context)
+        
+        # Read header to get ground elevation if available
+        if bil_path:
+            try:
+                # Try to find the header file
+                hdr_primary = bil_path.with_name(bil_path.name + '.hdr')  # foo.bil.hdr
+                hdr_fallback = bil_path.with_suffix('.hdr')               # foo.hdr
+                hdr_path_to_use = hdr_primary if hdr_primary.exists() else hdr_fallback
+                
+                if hdr_path_to_use.exists():
+                    from .src.envi_io import read_envi_header
+                    header = read_envi_header(hdr_path_to_use)
+                    if header.ground_elevation is not None:
+                        feedback.pushInfo(
+                            "Header ground elevation: {} m (parameter value: {} m)".format(
+                                header.ground_elevation, ground_alt))
+                        # Only use header value if user hasn't explicitly set a different value
+                        # We can't easily detect this, so we'll just inform the user
+            except Exception:
+                pass  # Ignore errors in reading header
         
         # Optional footprint output
         footprint_path = self.parameterAsOutputLayer(parameters, self.OUTPUT_FOOTPRINT, context)

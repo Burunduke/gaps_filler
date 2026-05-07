@@ -39,6 +39,7 @@ class EnviHeader:
     bbl: Optional[List[int]]               # bad band list as ints (0/1)
     band_names: Optional[List[str]]
     wavelength_units: Optional[str]        # e.g. 'nm', 'micrometers'
+    ground_elevation: Optional[float] = None  # ground elevation in meters, None if absent
 
 
 def read_envi_header(hdr_path: Union[str, Path]) -> EnviHeader:
@@ -102,6 +103,14 @@ def read_envi_header(hdr_path: Union[str, Path]) -> EnviHeader:
     if wavelength_units is not None:
         wavelength_units = str(wavelength_units)
     
+    # Extract ground elevation
+    ground_elevation = None
+    if 'ground elevation' in raw_header:
+        try:
+            ground_elevation = float(raw_header['ground elevation'])
+        except (ValueError, TypeError):
+            pass  # Keep as None if conversion fails
+    
     # Create and return the EnviHeader object
     return EnviHeader(
         path=str(hdr_path),
@@ -115,5 +124,6 @@ def read_envi_header(hdr_path: Union[str, Path]) -> EnviHeader:
         fwhm=fwhm,
         bbl=bbl,
         band_names=band_names,
-        wavelength_units=wavelength_units
+        wavelength_units=wavelength_units,
+        ground_elevation=ground_elevation
     )
