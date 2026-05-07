@@ -436,10 +436,6 @@ def flat_ground_grid(
         n_valid = int(np.count_nonzero(valid))
         up = np.full(n_valid, up_scalar, dtype=np.float64)
 
-        # Diagnostic counts
-        _diag_counts["downward"] += int(np.count_nonzero(downward))
-        _diag_counts["in_front"] += int(np.count_nonzero(in_front))
-        _diag_counts["valid"] += int(np.count_nonzero(valid))
 
         # Convert to geodetic coordinates for valid rays
         if np.any(valid):
