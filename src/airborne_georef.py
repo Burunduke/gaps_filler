@@ -318,16 +318,36 @@ def flat_ground_grid(
     """
     # Get view angles for all samples
     angles = sample_view_angles(sensor)  # shape: (samples,)
-    
+
     # Number of lines/frames
     lines = len(poses.lat)
     samples = sensor.samples
-    
+
     # Preallocate output arrays
     lon_grid = np.empty((lines, samples), dtype=np.float64)
     lat_grid = np.empty((lines, samples), dtype=np.float64)
     alt_grid = np.full((lines, samples), ground_alt, dtype=np.float64)
     valid_grid = np.zeros((lines, samples), dtype=bool)
+
+    # --- DIAGNOSTIC LOGGING (debug Windows "No valid geolocation points") ---
+    import sys as _sys
+    print(
+        "[flat_ground_grid] lines=%d samples=%d ground_alt=%r "
+        "aircraft_alt min=%.3f max=%.3f mean=%.3f fov_deg=%r" % (
+            lines, samples, ground_alt,
+            float(np.min(poses.alt)), float(np.max(poses.alt)),
+            float(np.mean(poses.alt)), sensor.fov_deg,
+        ),
+        file=_sys.stderr, flush=True,
+    )
+    if ground_alt >= float(np.min(poses.alt)):
+        print(
+            "[flat_ground_grid] WARNING: ground_alt (%r) >= min aircraft alt (%.3f); "
+            "rays cannot hit ground." % (ground_alt, float(np.min(poses.alt))),
+            file=_sys.stderr, flush=True,
+        )
+    _diag_first_exc = [None]
+    _diag_counts = {"downward": 0, "in_front": 0, "valid": 0, "exc_lines": 0}
     
     # Process each line/frame
     for line in range(lines):
@@ -401,6 +421,11 @@ def flat_ground_grid(
         east[valid] = scale[valid] * ray_e[valid]
         north[valid] = scale[valid] * ray_n[valid]
         
+        # Diagnostic counts
+        _diag_counts["downward"] += int(np.count_nonzero(downward))
+        _diag_counts["in_front"] += int(np.count_nonzero(in_front))
+        _diag_counts["valid"] += int(np.count_nonzero(valid))
+
         # Convert to geodetic coordinates for valid rays
         if np.any(valid):
             try:
@@ -413,10 +438,39 @@ def flat_ground_grid(
                 )
                 lon_grid[line, valid] = lon
                 lat_grid[line, valid] = lat
-            except Exception:
+            except Exception as _exc:
                 # If conversion fails, mark as invalid
                 valid_grid[line, :] = False
-    
+                _diag_counts["exc_lines"] += 1
+                if _diag_first_exc[0] is None:
+                    _diag_first_exc[0] = (
+                        type(_exc).__name__, str(_exc),
+                        "east.shape=%r up=%r lat0=%r lon0=%r aircraft_alt=%r" % (
+                            getattr(east[valid], "shape", None), up,
+                            lat0, lon0, aircraft_alt,
+                        ),
+                    )
+
+    # --- DIAGNOSTIC SUMMARY ---
+    print(
+        "[flat_ground_grid] summary: downward=%d in_front=%d valid=%d "
+        "exc_lines=%d total_pixels=%d" % (
+            _diag_counts["downward"], _diag_counts["in_front"],
+            _diag_counts["valid"], _diag_counts["exc_lines"],
+            lines * samples,
+        ),
+        file=_sys.stderr, flush=True,
+    )
+    if _diag_first_exc[0] is not None:
+        print(
+            "[flat_ground_grid] first enu2geodetic exception: %s: %s | %s" % _diag_first_exc[0],
+            file=_sys.stderr, flush=True,
+        )
+        print(
+            "[flat_ground_grid] pymap3d module: %r" % (getattr(enu2geodetic, "__module__", None),),
+            file=_sys.stderr, flush=True,
+        )
+
     return GroundGrid(lon=lon_grid, lat=lat_grid, alt=alt_grid, valid=valid_grid)
 
 
