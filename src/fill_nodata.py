@@ -28,7 +28,30 @@ honoured at coarse boundaries (sweeps, smoothing iterations, bands /
 tiles).
 """
 
+import os
+
 import numpy as np
+from osgeo import gdal
+
+
+def _safe_delete_raster(path: str, driver_name: str = "GTiff") -> None:
+    """Best-effort delete: try GDAL driver.Delete, fall back to os.remove.
+
+    Silently ignores errors — used for cleaning up output files before
+    overwriting them. Caller should ensure the path is safe to delete.
+    """
+    try:
+        drv = gdal.GetDriverByName(driver_name)
+        if drv is not None and os.path.exists(path):
+            drv.Delete(path)
+            return
+    except Exception:
+        pass
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -680,7 +703,6 @@ def _fill_band_worker(input_path, b, mask_path,
     The function is kept at module top level (harmless for threads,
     and future-proof in case we ever go back to a process pool).
     """
-    from osgeo import gdal  # local import: workers spawn fresh interpreters
     src = gdal.Open(input_path, gdal.GA_ReadOnly)
     if src is None:
         raise IOError("Cannot open {}".format(input_path))
@@ -778,9 +800,9 @@ def fill_nodata_file(input_path, output_path,
         out of a worker thread and the extra plumbing isn't worth it for
         the band-level granularity users actually see.
     """
-    from osgeo import gdal  # local import: keep plugin import-time light
 
     if feedback is not None:
+        feedback.pushInfo("Opening input: {}".format(input_path))
         feedback.pushInfo("Opening input: {}".format(input_path))
     src = gdal.Open(input_path, gdal.GA_ReadOnly)
     if src is None:
@@ -820,16 +842,7 @@ def fill_nodata_file(input_path, output_path,
     # driver.Create alone is not always enough to guarantee a clean
     # replacement — on some platforms the existing dataset can stay
     # partially live (cached by GDAL/QGIS).
-    if gdal.VSIStatL(output_path) is not None:
-        try:
-            driver.Delete(output_path)
-        except RuntimeError:
-            # Fallback: best-effort filesystem delete.
-            import os
-            try:
-                os.remove(output_path)
-            except OSError:
-                pass
+    _safe_delete_raster(output_path)
 
     # Use the first band's data type for the whole output. Hyperspectral
     # cubes (and basically every multi-band raster we care about) have
@@ -1018,7 +1031,6 @@ def fill_nodata_file_gdal(input_path, output_path,
     process pool. If the v2 fallback below kicks in, ``n_workers`` is
     forwarded so the user's choice still applies.
     """
-    from osgeo import gdal  # local import: keep plugin import-time light
 
     if feedback is not None and int(tile_size) > 0:
         feedback.pushInfo(
@@ -1096,15 +1108,7 @@ def fill_nodata_file_gdal(input_path, output_path,
     # Same defensive delete as in :func:`fill_nodata_file` -- ``CreateCopy``
     # alone does not always cleanly replace a pre-existing dataset that
     # GDAL/QGIS still references on Windows.
-    if gdal.VSIStatL(output_path) is not None:
-        try:
-            driver.Delete(output_path)
-        except RuntimeError:
-            import os as _os
-            try:
-                _os.remove(output_path)
-            except OSError:
-                pass
+    _safe_delete_raster(output_path)
 
     # ``gdal.FillNodata`` modifies its target band in place, so we need a
     # writable copy of the input as the destination. ``CreateCopy`` keeps

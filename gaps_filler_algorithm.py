@@ -20,7 +20,8 @@ from qgis.core import (
     QgsProcessingParameterRasterLayer,
 )
 
-from . import canvas_styling, fill_nodata, methods
+from .src import fill_nodata, methods
+from . import canvas_styling
 
 
 def _default_output_path(input_path, suffix):

@@ -21,8 +21,9 @@ from qgis.core import (
     QgsProcessingParameterRasterDestination,
 )
 
-from . import canvas_styling, frame_filter, methods, mosaic, pipeline
-from .frame_filter import (
+from .src import frame_filter, methods, mosaic, pipeline
+from . import canvas_styling
+from .src.frame_filter import (
     AREA_HI,
     AREA_LO,
     ASPECT_MAX,

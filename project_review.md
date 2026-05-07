@@ -447,3 +447,83 @@ Documentation updates to synchronize `project_review.md` with current code state
 - Updated method descriptions to reflect current implementation (no feathering/blending in mosaic methods)
 - Refreshed all stale line-number links
 - Removed dead links to non-existent `plans/roadmap.md`
+
+## Changelog — 2026-05-07 Code review pass
+
+Code-quality sweep across core modules. Behaviour-preserving except where noted; no public API changes.
+
+**[`fill_nodata.py`](fill_nodata.py:1).**
+- Hoisted `from osgeo import gdal` from inside `_fill_band_worker`, [`fill_nodata_file()`](fill_nodata.py:1), and [`fill_nodata_file_gdal()`](fill_nodata.py:1) to the top-of-module imports.
+- Extracted duplicated defensive file-deletion logic into module-level helper [`_safe_delete_raster(path, driver_name="GTiff")`](fill_nodata.py:1); both call sites in [`fill_nodata_file()`](fill_nodata.py:1) and [`fill_nodata_file_gdal()`](fill_nodata.py:1) now use it.
+
+**[`frame_filter.py`](frame_filter.py:1).**
+- [`_per_band_reject_reason()`](frame_filter.py:1) saturation check now distinguishes integer / floating / other dtypes via `np.issubdtype(...)`, so it no longer raises on non-int non-float arrays.
+
+**[`metadata.txt`](metadata.txt:1).**
+- Updated `description=` to correctly describe the plugin as offering multiple gap-filling methods, with GDAL's native `FillNodata` as the default and a pure-Python implementation as an alternative.
+
+**[`envi_io.py`](envi_io.py:1).**
+- Moved nested `_convert_list` helper from inside [`read_envi_header()`](envi_io.py:31) to module level. Behaviour unchanged.
+
+**[`airborne_georef.py`](airborne_georef.py:1).**
+- Extracted module-level [`_build_rotation_matrix(roll, pitch, yaw)`](airborne_georef.py:1) helper; replaces duplicated rotation-matrix construction in [`flat_ground_grid()`](airborne_georef.py:201), [`dem_ground_grid()`](airborne_georef.py:541), and the boresight rotations in both.
+- OGR resource creation in the footprint vector writing block (~lines 557–638) is now wrapped in `try/finally` so dataSource / layer / feature / geometry are always cleaned up on exception.
+- Footprint generation now reuses the already-computed `grid` instead of recomputing it.
+- Verified: convergence check already uses the `tolerance_m` parameter (no change needed; previous review claim was incorrect).
+
+**[`mosaic.py`](mosaic.py:1).**
+- Extracted [`_reproject_if_needed(path, ref_crs, ref_xres, ref_yres, out_dir)`](mosaic.py:1) helper; replaces three duplicated CRS-/resolution-comparison blocks in [`mosaic_frames()`](mosaic.py:96), `mosaic_frames_best_pixel()`, and [`mosaic_frames_vrt()`](mosaic.py:1).
+- `mosaic_frames_best_pixel()` no longer reads each source twice per chunk: a `pixel_cache` dict stores per-source pixel data from the validity-mask pass and is reused in the output-build pass; cache is cleared per-band to bound memory.
+
+**[`mosaic_quality.py`](mosaic_quality.py:1).**
+- [`_load_fillmask()`](mosaic_quality.py:1) replaced bare `except Exception` with specific `except (OSError, RuntimeError)` so unexpected errors propagate.
+
+### Reviewed but no change needed
+- [`fill_nodata.py:699`](fill_nodata.py:699) and [`fill_nodata.py:814`](fill_nodata.py:814) — `mask = marr != 1` is correct for both `rasterio.fill.fillnodata` (mask True = valid → don't fill) and the GDAL conversion path. Not inverted.
+- [`mosaic_quality.py`](mosaic_quality.py:46) — `os` is imported at module level (line 46). No missing import.
+- [`airborne_georef.py:400`](airborne_georef.py:400) — `enu2geodetic` unpacking is correct (`lat, lon, alt`).
+
+### Backlog / deferred
+- I6: expose seam-consistency metrics as [`MosaicQualityAlgorithm`](mosaic_quality_algorithm.py:21) outputs (feature addition, not a bug fix).
+- QGIS-wrapper cosmetic cleanups: extract `_handle_processing_exception` helper, move canvas-styling attachment block to [`canvas_styling.py`](canvas_styling.py:1), replace magic numbers like band-count `280` with named constants.
+- Larger reorganization: split workspace into `src/` (pure Python, GDAL/rasterio logic) and `qgis/` (QGIS Processing wrappers, plugin entry, provider). To be done as a separate task.
+
+## Changelog — 2026-05-07 Repository reorganization — pure-Python core moved to `src/`
+
+Layering made explicit: `src/` is now a pure GDAL/rasterio/numpy package with no QGIS dependency (testable, reusable in scripts), while the workspace root holds QGIS Processing wrappers and plugin glue. No logic was changed.
+
+### What changed
+- Created new package [`src/`](src/__init__.py:1) with empty [`src/__init__.py`](src/__init__.py:1).
+- Moved 9 pure-Python core modules into `src/`: [`airborne_georef.py`](src/airborne_georef.py:1), [`envi_io.py`](src/envi_io.py:1), [`fill_nodata.py`](src/fill_nodata.py:1), [`frame_filter.py`](src/frame_filter.py:1), [`methods.py`](src/methods.py:1), [`models.py`](src/models.py:1), [`mosaic.py`](src/mosaic.py:1), [`mosaic_quality.py`](src/mosaic_quality.py:1), [`pipeline.py`](src/pipeline.py:1).
+- All QGIS-facing files stay at the workspace root: [`__init__.py`](__init__.py:1), [`gaps_filler.py`](gaps_filler.py:1), [`gaps_filler_provider.py`](gaps_filler_provider.py:1), the `*_algorithm.py` modules, [`canvas_styling.py`](canvas_styling.py:1), [`metadata.txt`](metadata.txt:1), [`pb_tool.cfg`](pb_tool.cfg:1), etc.
+- Updated imports throughout:
+  - Inside `src/`: cross-module imports use relative form (e.g. `from .models import …`, `from . import fill_nodata, frame_filter, mosaic`).
+  - Root QGIS files now import core logic via `from .src import …` or `from .src.<module> import …`.
+- Updated [`pb_tool.cfg`](pb_tool.cfg:1): added `src` to `extra_dirs`; removed the 9 moved files from `python_files`.
+- Verification subtask grepped for stale references and caught two leftovers in [`frame_filter_algorithm.py`](frame_filter_algorithm.py:1) and [`hyperspectral_algorithm.py`](hyperspectral_algorithm.py:1) (`from .frame_filter import (…)` → fixed to `from .src.frame_filter import (…)`).
+
+### New project layout
+```
+gaps_filler/
+├── __init__.py                 # plugin entry (classFactory)
+├── gaps_filler.py              # plugin class
+├── gaps_filler_provider.py     # QGIS Processing provider
+├── *_algorithm.py              # six QGIS Processing algorithms
+├── canvas_styling.py           # QGIS post-processors
+├── metadata.txt, pb_tool.cfg, icon.png, resources.*
+└── src/                        # pure-Python core (no QGIS imports)
+    ├── __init__.py
+    ├── airborne_georef.py
+    ├── envi_io.py
+    ├── fill_nodata.py
+    ├── frame_filter.py
+    ├── methods.py
+    ├── models.py
+    ├── mosaic.py
+    ├── mosaic_quality.py
+    └── pipeline.py
+```
+
+### Backlog / deferred (carried forward)
+- Expose seam-consistency metrics as [`MosaicQualityAlgorithm`](mosaic_quality_algorithm.py:21) outputs.
+- QGIS-wrapper cosmetic cleanups: extract `_handle_processing_exception` helper, move the canvas-styling attachment block into [`canvas_styling.py`](canvas_styling.py:1), replace magic numbers like band-count default `280` with named constants.

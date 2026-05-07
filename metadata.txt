@@ -10,7 +10,7 @@ version=0.2
 author=Duke
 email=st087204@student.spbu.ru
 
-about=Fills NoData gaps in single-band rasters using a pure-Python re-implementation of GDAL's FillNodata (inverse-distance-weighted or nearest interpolation, with optional smoothing). Input: any GDAL-readable raster + optional validity mask. Output: GeoTIFF added to the QGIS canvas. Requires rasterio >= 1.3 (uses dtype= / nodata= kwargs on rasterio.merge.merge); scipy and scikit-image are optional.
+about=Fills NoData gaps in single-band rasters using multiple methods including GDAL's native FillNodata (default) and a pure-Python implementation (alternative). Input: any GDAL-readable raster + optional validity mask. Output: GeoTIFF added to the QGIS canvas. Requires rasterio >= 1.3 (uses dtype= / nodata= kwargs on rasterio.merge.merge); scipy and scikit-image are optional.
 
 tracker=https://github.com/Burunduke/gaps_filler/issues
 repository=https://github.com/Burunduke/gaps_filler

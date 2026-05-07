@@ -26,7 +26,8 @@ from qgis.core import (
     QgsProcessingParameterRasterDestination,
 )
 
-from . import canvas_styling, methods, mosaic
+from .src import methods, mosaic
+from . import canvas_styling
 
 
 def _default_mosaic_output(input_paths):

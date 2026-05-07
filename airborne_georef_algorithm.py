@@ -22,7 +22,8 @@ from qgis.core import (
     QgsProcessingParameterRasterLayer,
 )
 
-from . import airborne_georef, canvas_styling, models
+from .src import airborne_georef, models
+from . import canvas_styling
 
 
 def _is_empty_output(raw):

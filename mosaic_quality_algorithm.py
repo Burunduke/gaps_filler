@@ -17,7 +17,7 @@ from qgis.core import (
     QgsProcessingParameterRasterLayer,
 )
 
-from . import mosaic_quality
+from .src import mosaic_quality
 
 
 class MosaicQualityAlgorithm(QgsProcessingAlgorithm):

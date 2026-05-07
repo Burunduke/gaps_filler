@@ -21,9 +21,8 @@ from qgis.core import (
     QgsProcessingParameterNumber,
 )
 
-from . import frame_filter
-from . import methods
-from .frame_filter import (
+from .src import frame_filter, methods
+from .src.frame_filter import (
     AREA_HI,
     AREA_LO,
     ASPECT_MAX,

@@ -16,8 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
-from models import FlightLineMeta, discover_flight_line
-from envi_io import read_envi_header
+from .models import FlightLineMeta, discover_flight_line
+from .envi_io import read_envi_header
 
 # Import for ENU transformations
 try:
@@ -221,6 +221,52 @@ def sample_view_angles(sensor: PushbroomSensor) -> np.ndarray:
     return angles
 
 
+def _build_rotation_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """Build 3x3 rotation matrix from roll/pitch/yaw (radians).
+
+    Rotation order matches the original implementation in flat_ground_grid /
+    dem_ground_grid (verify before changing).
+    """
+    # Create rotation matrices helper functions
+    def rotation_x(angle):
+        """Rotation matrix around x-axis"""
+        cos_a = np.cos(angle)
+        sin_a = np.sin(angle)
+        return np.array([
+            [1, 0, 0],
+            [0, cos_a, -sin_a],
+            [0, sin_a, cos_a]
+        ])
+    
+    def rotation_y(angle):
+        """Rotation matrix around y-axis"""
+        cos_a = np.cos(angle)
+        sin_a = np.sin(angle)
+        return np.array([
+            [cos_a, 0, sin_a],
+            [0, 1, 0],
+            [-sin_a, 0, cos_a]
+        ])
+    
+    def rotation_z(angle):
+        """Rotation matrix around z-axis"""
+        cos_a = np.cos(angle)
+        sin_a = np.sin(angle)
+        return np.array([
+            [cos_a, -sin_a, 0],
+            [sin_a, cos_a, 0],
+            [0, 0, 1]
+        ])
+    
+    # Create rotation matrix: R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+    Rz = rotation_z(yaw)
+    Ry = rotation_y(pitch)
+    Rx = rotation_x(roll)
+    R = Rz @ Ry @ Rx
+    
+    return R
+
+
 def flat_ground_grid(
     poses: FramePoses,
     sensor: PushbroomSensor,
@@ -283,37 +329,6 @@ def flat_ground_grid(
     alt_grid = np.full((lines, samples), ground_alt, dtype=np.float64)
     valid_grid = np.zeros((lines, samples), dtype=bool)
     
-    # Create rotation matrices helper functions
-    def rotation_x(angle):
-        """Rotation matrix around x-axis"""
-        cos_a = np.cos(angle)
-        sin_a = np.sin(angle)
-        return np.array([
-            [1, 0, 0],
-            [0, cos_a, -sin_a],
-            [0, sin_a, cos_a]
-        ])
-    
-    def rotation_y(angle):
-        """Rotation matrix around y-axis"""
-        cos_a = np.cos(angle)
-        sin_a = np.sin(angle)
-        return np.array([
-            [cos_a, 0, sin_a],
-            [0, 1, 0],
-            [-sin_a, 0, cos_a]
-        ])
-    
-    def rotation_z(angle):
-        """Rotation matrix around z-axis"""
-        cos_a = np.cos(angle)
-        sin_a = np.sin(angle)
-        return np.array([
-            [cos_a, -sin_a, 0],
-            [sin_a, cos_a, 0],
-            [0, 0, 1]
-        ])
-    
     # Process each line/frame
     for line in range(lines):
         # Get pose for this line
@@ -326,10 +341,7 @@ def flat_ground_grid(
         
         # Create rotation matrix: R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
         # This is the standard aerospace convention for Euler angles
-        Rz = rotation_z(yaw)
-        Ry = rotation_y(pitch)
-        Rx = rotation_x(roll)
-        R = Rz @ Ry @ Rx
+        R = _build_rotation_matrix(roll, pitch, yaw)
         
         # Apply boresight rotation if specified
         # Convert boresight angles from degrees to radians
@@ -339,10 +351,7 @@ def flat_ground_grid(
             boresight_yaw_rad = np.radians(boresight_yaw_deg)
             
             # Create boresight rotation matrix: R_b = Rz(yaw) @ Ry(pitch) @ Rx(roll)
-            Rz_b = rotation_z(boresight_yaw_rad)
-            Ry_b = rotation_y(boresight_pitch_rad)
-            Rx_b = rotation_x(boresight_roll_rad)
-            R_b = Rz_b @ Ry_b @ Rx_b
+            R_b = _build_rotation_matrix(boresight_roll_rad, boresight_pitch_rad, boresight_yaw_rad)
             
             # Apply boresight rotation: R_enu_from_camera = R_enu_from_imu * R_imu_from_camera
             R = R @ R_b
@@ -531,72 +540,89 @@ def write_footprint_vector(
     if datasource is None:
         raise RuntimeError(f"Failed to create datasource at {footprint_path}")
     
-    # Create layer
-    layer_name = Path(footprint_path).stem
-    layer = datasource.CreateLayer(layer_name, geom_type=ogr.wkbPolygon)
-    if layer is None:
-        datasource.Destroy()
-        raise RuntimeError("Failed to create layer")
+    # Initialize variables for cleanup
+    layer = None
+    feature = None
+    ring = None
+    polygon = None
+    spatial_ref = None
+    output_ref = None
+    transform = None
     
-    # Add fields
-    field_defn = ogr.FieldDefn("flight_line", ogr.OFTString)
-    field_defn.SetWidth(255)
-    layer.CreateField(field_defn)
+    try:
+        # Create layer
+        layer_name = Path(footprint_path).stem
+        layer = datasource.CreateLayer(layer_name, geom_type=ogr.wkbPolygon)
+        if layer is None:
+            raise RuntimeError("Failed to create layer")
+        
+        # Add fields
+        field_defn = ogr.FieldDefn("flight_line", ogr.OFTString)
+        field_defn.SetWidth(255)
+        layer.CreateField(field_defn)
+        
+        field_defn = ogr.FieldDefn("n_frames", ogr.OFTInteger)
+        layer.CreateField(field_defn)
+        
+        field_defn = ogr.FieldDefn("n_xtrack", ogr.OFTInteger)
+        layer.CreateField(field_defn)
+        
+        # Add mean_alt_m field if altitude data is available
+        field_defn = ogr.FieldDefn("mean_alt_m", ogr.OFTReal)
+        layer.CreateField(field_defn)
+        
+        # Create feature
+        feature = ogr.Feature(layer.GetLayerDefn())
+        
+        # Set attributes
+        feature.SetField("flight_line", flight_line_name)
+        feature.SetField("n_frames", grid.lon.shape[0])
+        feature.SetField("n_xtrack", grid.lon.shape[1])
+        
+        # Calculate mean altitude if all alt values are the same (flat grid)
+        if np.all(grid.alt == grid.alt[0, 0]):
+            feature.SetField("mean_alt_m", float(grid.alt[0, 0]))
+        # For DEM grids, we could calculate mean, but for now we'll leave it unset
+        
+        # Create polygon geometry
+        ring = ogr.Geometry(ogr.wkbLinearRing)
+        for lon, lat in ring_points:
+            ring.AddPoint(lon, lat)
+        
+        polygon = ogr.Geometry(ogr.wkbPolygon)
+        polygon.AddGeometry(ring)
+        
+        # Set CRS
+        spatial_ref = osr.SpatialReference()
+        spatial_ref.SetFromUserInput("EPSG:4326")
+        polygon.AssignSpatialReference(spatial_ref)
+        
+        # Transform to output CRS if needed
+        if dst_crs != "EPSG:4326":
+            output_ref = osr.SpatialReference()
+            output_ref.SetFromUserInput(dst_crs)
+            transform = osr.CoordinateTransformation(spatial_ref, output_ref)
+            polygon.Transform(transform)
+        
+        feature.SetGeometry(polygon)
+        
+        # Create feature in layer
+        if layer.CreateFeature(feature) != 0:
+            raise RuntimeError("Failed to create feature")
     
-    field_defn = ogr.FieldDefn("n_frames", ogr.OFTInteger)
-    layer.CreateField(field_defn)
-    
-    field_defn = ogr.FieldDefn("n_xtrack", ogr.OFTInteger)
-    layer.CreateField(field_defn)
-    
-    # Add mean_alt_m field if altitude data is available
-    field_defn = ogr.FieldDefn("mean_alt_m", ogr.OFTReal)
-    layer.CreateField(field_defn)
-    
-    # Create feature
-    feature = ogr.Feature(layer.GetLayerDefn())
-    
-    # Set attributes
-    feature.SetField("flight_line", flight_line_name)
-    feature.SetField("n_frames", grid.lon.shape[0])
-    feature.SetField("n_xtrack", grid.lon.shape[1])
-    
-    # Calculate mean altitude if all alt values are the same (flat grid)
-    if np.all(grid.alt == grid.alt[0, 0]):
-        feature.SetField("mean_alt_m", float(grid.alt[0, 0]))
-    # For DEM grids, we could calculate mean, but for now we'll leave it unset
-    
-    # Create polygon geometry
-    ring = ogr.Geometry(ogr.wkbLinearRing)
-    for lon, lat in ring_points:
-        ring.AddPoint(lon, lat)
-    
-    polygon = ogr.Geometry(ogr.wkbPolygon)
-    polygon.AddGeometry(ring)
-    
-    # Set CRS
-    spatial_ref = osr.SpatialReference()
-    spatial_ref.SetFromUserInput("EPSG:4326")
-    polygon.AssignSpatialReference(spatial_ref)
-    
-    # Transform to output CRS if needed
-    if dst_crs != "EPSG:4326":
-        output_ref = osr.SpatialReference()
-        output_ref.SetFromUserInput(dst_crs)
-        transform = osr.CoordinateTransformation(spatial_ref, output_ref)
-        polygon.Transform(transform)
-    
-    feature.SetGeometry(polygon)
-    
-    # Create feature in layer
-    if layer.CreateFeature(feature) != 0:
-        feature.Destroy()
-        datasource.Destroy()
-        raise RuntimeError("Failed to create feature")
-    
-    # Cleanup
-    feature.Destroy()
-    datasource.Destroy()
+    finally:
+        # Cleanup OGR objects
+        if feature is not None:
+            feature.Destroy()
+        if layer is not None:
+            layer = None
+        if datasource is not None:
+            datasource.Destroy()
+        if polygon is not None:
+            polygon.Destroy()
+        if ring is not None:
+            ring.Destroy()
+        # spatial_ref, output_ref, transform don't need explicit cleanup in GDAL/OGR Python
 
 
 @dataclass(frozen=True)
@@ -795,22 +821,12 @@ def write_flat_geotiff(
      
     # Write footprint vector file if requested
     if footprint_path is not None:
-        # Use either flat or DEM-aware grid for footprint
-        if dem_path is None:
-            footprint_grid = flat_ground_grid(poses, sensor, ground_alt=ground_alt,
-                                            boresight_roll_deg=boresight_roll_deg,
-                                            boresight_pitch_deg=boresight_pitch_deg,
-                                            boresight_yaw_deg=boresight_yaw_deg)
-        else:
-            footprint_grid = dem_ground_grid(poses, sensor, dem_path, fallback_ground_alt=ground_alt,
-                                           boresight_roll_deg=boresight_roll_deg,
-                                           boresight_pitch_deg=boresight_pitch_deg,
-                                           boresight_yaw_deg=boresight_yaw_deg)
-        
+        # Reuse the already computed grid for footprint
+        # The grid has the same shape and resolution as would be computed for footprint
         # Write the footprint with a small simplification tolerance (half a pixel in degrees)
         # For projected CRS, we'd need to convert to meters, but for now we'll use a small value
         write_footprint_vector(
-            grid=footprint_grid,
+            grid=grid,
             footprint_path=footprint_path,
             dst_crs=dst_crs,
             flight_line_name=meta.name,
@@ -905,37 +921,6 @@ def dem_ground_grid(
         alt_grid = np.empty((lines, samples), dtype=np.float64)
         valid_grid = np.zeros((lines, samples), dtype=bool)
         
-        # Create rotation matrices helper functions
-        def rotation_x(angle):
-            """Rotation matrix around x-axis"""
-            cos_a = np.cos(angle)
-            sin_a = np.sin(angle)
-            return np.array([
-                [1, 0, 0],
-                [0, cos_a, -sin_a],
-                [0, sin_a, cos_a]
-            ])
-        
-        def rotation_y(angle):
-            """Rotation matrix around y-axis"""
-            cos_a = np.cos(angle)
-            sin_a = np.sin(angle)
-            return np.array([
-                [cos_a, 0, sin_a],
-                [0, 1, 0],
-                [-sin_a, 0, cos_a]
-            ])
-        
-        def rotation_z(angle):
-            """Rotation matrix around z-axis"""
-            cos_a = np.cos(angle)
-            sin_a = np.sin(angle)
-            return np.array([
-                [cos_a, -sin_a, 0],
-                [sin_a, cos_a, 0],
-                [0, 0, 1]
-            ])
-        
         # Process each line/frame
         for line in range(lines):
             # Get pose for this line
@@ -947,10 +932,7 @@ def dem_ground_grid(
             yaw = poses.yaw[line]
             
             # Create rotation matrix: R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
-            Rz = rotation_z(yaw)
-            Ry = rotation_y(pitch)
-            Rx = rotation_x(roll)
-            R = Rz @ Ry @ Rx
+            R = _build_rotation_matrix(roll, pitch, yaw)
             
             # Apply boresight rotation if specified
             # Convert boresight angles from degrees to radians
@@ -960,10 +942,7 @@ def dem_ground_grid(
                 boresight_yaw_rad = np.radians(boresight_yaw_deg)
                 
                 # Create boresight rotation matrix: R_b = Rz(yaw) @ Ry(pitch) @ Rx(roll)
-                Rz_b = rotation_z(boresight_yaw_rad)
-                Ry_b = rotation_y(boresight_pitch_rad)
-                Rx_b = rotation_x(boresight_roll_rad)
-                R_b = Rz_b @ Ry_b @ Rx_b
+                R_b = _build_rotation_matrix(boresight_roll_rad, boresight_pitch_rad, boresight_yaw_rad)
                 
                 # Apply boresight rotation: R_enu_from_camera = R_enu_from_imu * R_imu_from_camera
                 R = R @ R_b

@@ -456,8 +456,12 @@ def _per_band_reject_reason(
             # within the valid footprint count as "lost". NoData is
             # excluded from the denominator -- we only judge the
             # within-swath pixels.
-            sat_value = (np.iinfo(dtype).max
-                         if np.issubdtype(dtype, np.integer) else None)
+            if np.issubdtype(dtype, np.floating):
+                sat_value = None
+            elif np.issubdtype(dtype, np.integer):
+                sat_value = np.iinfo(dtype).max
+            else:
+                sat_value = None
             inside = arr[valid_mask]
             zero_or_sat = (inside == 0)
             if sat_value is not None:

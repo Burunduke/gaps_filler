@@ -12,6 +12,19 @@ from pathlib import Path
 from typing import List, Optional, Union
 
 
+def _convert_list(value, converter):
+    """Convert a value to a list with the given converter function."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        # Handle comma-separated strings
+        value = [v.strip() for v in value.split(',')]
+    try:
+        return [converter(v) for v in value]
+    except (ValueError, TypeError):
+        return None
+
+
 @dataclass(frozen=True)
 class EnviHeader:
     path: str                 # absolute path to .hdr
@@ -81,18 +94,6 @@ def read_envi_header(hdr_path: Union[str, Path]) -> EnviHeader:
     byte_order = int(raw_header.get('byte order', 0))  # Default to 0 if absent
     
     # Extract optional fields with proper type conversion
-    def _convert_list(value, converter):
-        """Convert a value to a list with the given converter function."""
-        if value is None:
-            return None
-        if isinstance(value, str):
-            # Handle comma-separated strings
-            value = [v.strip() for v in value.split(',')]
-        try:
-            return [converter(v) for v in value]
-        except (ValueError, TypeError):
-            return None
-    
     wavelengths = _convert_list(raw_header.get('wavelength'), float)
     fwhm = _convert_list(raw_header.get('fwhm'), float)
     bbl = _convert_list(raw_header.get('bbl'), int)

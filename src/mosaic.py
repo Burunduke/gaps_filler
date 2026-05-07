@@ -120,6 +120,27 @@ def validate_inputs(
     }
 
 
+def _reproject_if_needed(path, ref_crs, ref_xres, ref_yres, out_dir):
+    """Return `path` unchanged if the raster already matches the reference
+    grid (CRS + pixel size within `_PIXEL_REL_TOL`), otherwise reproject
+    via `_reproject_to_reference` and return the new path.
+    """
+    with rasterio.open(path) as src:
+        same_crs = (src.crs == ref_crs)
+        xr = abs(src.transform.a)
+        yr = abs(src.transform.e)
+        same_res = (
+            abs(xr - ref_xres) <= _PIXEL_REL_TOL * ref_xres
+            and abs(yr - ref_yres) <= _PIXEL_REL_TOL * ref_yres
+        )
+        if same_crs and same_res:
+            return path
+    return _reproject_to_reference(
+        path, ref_crs=ref_crs, ref_xres=ref_xres, ref_yres=ref_yres,
+        out_dir=out_dir,
+    )
+
+
 def _reproject_to_reference(
     path: str,
     *,
@@ -214,16 +235,7 @@ def mosaic_frames(
     if reproject_to_first:
         tmp_dir = tempfile.mkdtemp(prefix="mosaic_reproj_")
         for i, p in enumerate(paths):
-            with rasterio.open(p) as src:
-                same_crs = (src.crs == ref_crs)
-                xr = abs(src.transform.a)
-                yr = abs(src.transform.e)
-                same_res = (
-                    abs(xr - xres) <= _PIXEL_REL_TOL * xres
-                    and abs(yr - yres) <= _PIXEL_REL_TOL * yres)
-            if same_crs and same_res:
-                continue
-            effective_paths[i] = _reproject_to_reference(
+            effective_paths[i] = _reproject_if_needed(
                 p, ref_crs=ref_crs, ref_xres=xres, ref_yres=yres,
                 out_dir=tmp_dir,
             )
@@ -438,16 +450,7 @@ def mosaic_frames_best_pixel(
     if reproject_to_first:
         tmp_dir = tempfile.mkdtemp(prefix="mosaic_reproj_")
         for i, p in enumerate(paths):
-            with rasterio.open(p) as src:
-                same_crs = (src.crs == ref_crs)
-                xr = abs(src.transform.a)
-                yr = abs(src.transform.e)
-                same_res = (
-                    abs(xr - xres) <= _PIXEL_REL_TOL * xres
-                    and abs(yr - yres) <= _PIXEL_REL_TOL * yres)
-            if same_crs and same_res:
-                continue
-            effective_paths[i] = _reproject_to_reference(
+            effective_paths[i] = _reproject_if_needed(
                 p, ref_crs=ref_crs, ref_xres=xres, ref_yres=yres,
                 out_dir=tmp_dir,
             )
@@ -536,6 +539,9 @@ def mosaic_frames_best_pixel(
                 # These will be updated across all chunks for this band
                 best_dist = np.zeros((height, width), dtype=np.float32)
                 best_src = np.zeros((height, width), dtype=np.uint16)  # 0 = nodata, 1-based source indices
+                
+                # Cache to store pixel data from the first pass
+                pixel_cache = {}  # src_idx -> arr
 
                 # Process each chunk
                 for chunk_idx, chunk in enumerate(path_chunks):
@@ -576,6 +582,9 @@ def mosaic_frames_best_pixel(
                             if not valid_mask.any():
                                 continue
                                 
+                            # Store pixel data in cache for later use
+                            pixel_cache[src_idx] = arr.copy()
+                                
                             # Compute distance transform for this source
                             distance = distance_transform_edt(valid_mask)
                             
@@ -601,41 +610,21 @@ def mosaic_frames_best_pixel(
                 # and read that band from each source for those pixels
                 out_band = np.full((height, width), nan, dtype=np.float32)
                 
-                # Process each source to fill in its pixels
-                for chunk_idx, chunk in enumerate(path_chunks):
-                    sources = [rasterio.open(p) for p in chunk]
-                    try:
-                        for src_idx_in_chunk, src in enumerate(sources):
-                            src_idx = chunk_idx * _MAX_OPEN_SOURCES + src_idx_in_chunk + 1
-                            
-                            # Find pixels that should come from this source
-                            src_pixels = best_src == src_idx
-                            if not src_pixels.any():
-                                continue
-                                
-                            # Read the band data for this source reprojected onto output grid
-                            arr_3d, _ = merge(
-                                [src],
-                                indexes=[b],
-                                method="first",
-                                dtype="float32",
-                                nodata=nan,
-                                res=(xres, yres),
-                                bounds=out_bounds,
-                            )
-                            arr = arr_3d[0]
-                            if arr.dtype != np.float32:
-                                arr = arr.astype(np.float32)
-                            # Normalise per-source NoData to NaN
-                            if (src_nodata is not None
-                                    and not nodata_is_nan):
-                                arr[arr == np.float32(src_nodata)] = nan
-                                
-                            # Fill in pixels from this source
-                            out_band[src_pixels] = arr[src_pixels]
-                    finally:
-                        for s in sources:
-                            s.close()
+                # Process each source to fill in its pixels using cached data
+                for src_idx in pixel_cache:
+                    # Find pixels that should come from this source
+                    src_pixels = best_src == src_idx
+                    if not src_pixels.any():
+                        continue
+                        
+                    # Get the band data from cache
+                    arr = pixel_cache[src_idx]
+                    
+                    # Fill in pixels from this source
+                    out_band[src_pixels] = arr[src_pixels]
+                
+                # Clean up cache for this band to manage memory
+                pixel_cache.clear()
                 
                 # Write the band to output
                 dst.write(out_band, b)
@@ -749,16 +738,7 @@ def mosaic_frames_vrt(
     if reproject_to_first:
         tmp_dir = tempfile.mkdtemp(prefix="mosaic_reproj_")
         for i, p in enumerate(paths):
-            with rasterio.open(p) as src:
-                same_crs = (src.crs == ref_crs)
-                xr = abs(src.transform.a)
-                yr = abs(src.transform.e)
-                same_res = (
-                    abs(xr - xres) <= _PIXEL_REL_TOL * xres
-                    and abs(yr - yres) <= _PIXEL_REL_TOL * yres)
-            if same_crs and same_res:
-                continue
-            effective_paths[i] = _reproject_to_reference(
+            effective_paths[i] = _reproject_if_needed(
                 p, ref_crs=ref_crs, ref_xres=xres, ref_yres=yres,
                 out_dir=tmp_dir,
             )

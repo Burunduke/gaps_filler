@@ -43,6 +43,7 @@ computed. After warping the two arrays share shape by construction, so
 the old "size mismatch" failure cannot occur.
 """
 
+import os
 import json
 import math
 from pathlib import Path
@@ -94,7 +95,7 @@ def _load_fillmask(mosaic_path):
             
         fillmask_arr = fillmask_ds.ReadAsArray()
         return fillmask_arr
-    except Exception as e:
+    except (OSError, RuntimeError) as e:
         logging.warning("Error loading fillmask: {}".format(str(e)))
         return None
 
