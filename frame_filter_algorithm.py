@@ -2,7 +2,7 @@
 """Processing algorithm wrapper around :mod:`frame_filter`.
 
 Exposes Stage A of the hyperspectral pipeline (rejecting obviously-bad
-PIKA-L frames) as a standalone QGIS Processing algorithm.
+hyperspectral frames) as a standalone QGIS Processing algorithm.
 """
 
 import os
@@ -42,7 +42,7 @@ _LOG_CAP = 1000
 
 
 class FrameFilterAlgorithm(QgsProcessingAlgorithm):
-    """Reject obviously-bad PIKA-L frames; copy the survivors to a folder."""
+    """Reject obviously-bad hyperspectral frames; copy the survivors to a folder."""
 
     INPUT_LAYERS = "INPUT_LAYERS"
     OUTPUT_FOLDER = "OUTPUT_FOLDER"
@@ -94,7 +94,7 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
 
     def shortHelpString(self):
         return self.tr(
-            "Rejects obviously-bad PIKA-L frames and copies the survivors "
+            "Rejects obviously-bad hyperspectral frames and copies the survivors "
             "into the chosen output folder; the rejection report lists "
             "why each frame was dropped. The actual rejection rule is "
             "picked from the 'Filter method' dropdown (v1 — hard "
@@ -140,7 +140,7 @@ class FrameFilterAlgorithm(QgsProcessingAlgorithm):
             "tuning each one. 'Custom' uses the raw values below "
             "(unchanged behaviour). 'Permissive' relaxes every "
             "threshold (use when v1 over-rejects on a new sensor). "
-            "'Default' matches the documented PIKA-L defaults. "
+            "'Default' matches typical hyperspectral sensor defaults. "
             "'Strict' tightens every threshold (clean acquisitions, "
             "drop on any doubt). When a non-Custom preset is chosen "
             "the raw threshold inputs below are ignored."

@@ -3,9 +3,9 @@
 
 Pipeline TO-DO #15: when a Processing algorithm produces a hyperspectral
 mosaic and the user has the standard "open output file after running"
-option enabled, QGIS by default shows band 1 in grayscale. For PIKA-L
-cubes (~280 bands spanning ~400-1000 nm) that is a near-black NIR-ish
-slice and a poor first impression. We attach a layer post-processor to
+option enabled, QGIS by default shows band 1 in grayscale. For typical
+hyperspectral cubes (with hundreds of bands spanning the visible to near-infrared
+spectrum) that is a near-black NIR-ish slice and a poor first impression. We attach a layer post-processor to
 the output details so QGIS swaps in a 3-band RGB composite renderer
 once the layer is loaded onto the canvas.
 
@@ -24,7 +24,7 @@ from qgis.core import (
 )
 
 
-# Approximate spectral coverage of PIKA-L cubes is ~400-1000 nm. We pick
+# Approximate spectral coverage of typical hyperspectral sensors is ~400-1000 nm. We pick
 # RGB triplets as fractional positions of the band count so the rule
 # survives sensor truncation and degrades cleanly on shorter cubes:
 #   * red   ~ 640 nm  -> 40% of the way through 400-1000 nm

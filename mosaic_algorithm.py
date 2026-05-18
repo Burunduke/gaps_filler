@@ -151,7 +151,7 @@ class MosaicAlgorithm(QgsProcessingAlgorithm):
             parameters, self.OUTPUT, context)
 
         # Pipeline TO-DO #15: queue an RGB-composite post-processor so
-        # the auto-loaded mosaic shows a colour view (PIKA-L cubes
+        # the auto-loaded mosaic shows a colour view (hyperspectral cubes
         # default to a near-black band-1 in grayscale otherwise). The
         # mosaic preserves the input band count, so we read it from
         # the first input layer.

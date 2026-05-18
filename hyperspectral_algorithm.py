@@ -59,7 +59,7 @@ def _is_empty_output(raw):
 
 
 class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
-    """Filter bad PIKA-L frames, mosaic the survivors, then fill gaps."""
+    """Filter bad hyperspectral frames, mosaic the survivors, then fill gaps."""
 
     INPUT_LAYERS = "INPUT_LAYERS"
     MAX_DISTANCE = "MAX_DISTANCE"
@@ -124,7 +124,7 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
 
     def shortHelpString(self):
         return self.tr(
-            "End-to-end PIKA-L pipeline: rejects obviously-bad frames, "
+            "End-to-end hyperspectral pipeline: rejects obviously-bad frames, "
             "mosaics the survivors, and fills NoData gaps in every band "
             "of the resulting mosaic. Per-stage behaviour is "
             "method-dependent — pick a frame-filter / mosaic / gap-fill "
@@ -209,7 +209,7 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
             "instead of tuning each one. 'Custom' uses the raw values "
             "below (unchanged behaviour). 'Permissive' relaxes every "
             "threshold (use when v1 over-rejects on a new sensor). "
-            "'Default' matches the documented PIKA-L defaults. "
+            "'Default' matches typical hyperspectral sensor defaults. "
             "'Strict' tightens every threshold (clean acquisitions, "
             "drop on any doubt). When a non-Custom preset is chosen "
             "the raw threshold inputs below are ignored."
@@ -485,7 +485,7 @@ class HyperspectralPipelineAlgorithm(QgsProcessingAlgorithm):
 
             # Pipeline TO-DO #15: queue an RGB-composite post-processor
             # so the auto-loaded filled mosaic shows a colour view
-            # instead of PIKA-L's near-black grayscale band 1. The
+            # instead of hyperspectral sensor's near-black grayscale band 1. The
             # output preserves the input band count, so the first
             # input layer's band count is what the renderer should
             # target.

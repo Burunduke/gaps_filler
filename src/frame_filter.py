@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Stage A of the hyperspectral pipeline.
 
-Reject obviously-bad PIKA-L frames before mosaicking. Each frame is a
+Reject obviously-bad hyperspectral frames before mosaicking. Each frame is a
 georeferenced GeoTIFF; NoData is taken from ``src.nodata``. All frames are
 assumed to share CRS and pixel size — that invariant is checked in Stage B,
 not here.
@@ -36,7 +36,7 @@ from rasterio.windows import Window
 
 
 # ---------------------------------------------------------------------------
-# Thresholds (tuned for PIKA-L frames; see hyperspectral_plan.md, Stage A).
+# Thresholds (tuned for hyperspectral frames; see hyperspectral_plan.md, Stage A).
 # Kept as module-level constants so they remain the documented defaults.
 # ---------------------------------------------------------------------------
 

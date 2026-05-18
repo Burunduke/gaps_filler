@@ -1,7 +1,7 @@
 """
-Module for parsing PIKA-L airborne navigation data and interpolating per-frame poses.
+Module for parsing airborne navigation data from hyperspectral sensors and interpolating per-frame poses.
 
-This module handles parsing of Resonon .lcf (navigation log) and .times (per-frame timestamps) files,
+This module handles parsing of navigation log (.lcf) and per-frame timestamps (.times) files,
 and interpolates pose data (position and orientation) for each frame using relative time alignment.
 The .lcf and .times files may have different absolute time epochs but should cover the same
 flight segment duration, allowing alignment by relative time within each file.
@@ -9,7 +9,7 @@ flight segment duration, allowing alignment by relative time within each file.
 The implementation assumes:
 - .lcf file has 11 whitespace-separated columns with navigation data
 - .times file has a single column of timestamps, length matching ENVI header 'lines'
-- Both files cover the same flight segment (standard Resonon convention)
+- Both files cover the same flight segment
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ except ImportError:
 
 @dataclass(frozen=True)
 class LcfTable:
-    """Raw rows from a .lcf file (Resonon LCF nav log)."""
+    """Raw rows from a .lcf file (navigation log)."""
     time: np.ndarray   # shape (N,), seconds, raw absolute
     roll: np.ndarray   # radians
     pitch: np.ndarray
@@ -80,7 +80,7 @@ class FramePoses:
 
 @dataclass(frozen=True)
 class PushbroomSensor:
-    """Simple cross-track-only sensor model for PIKA-L-like line scanners."""
+    """Simple cross-track-only sensor model for hyperspectral pushbroom sensors."""
     samples: int              # cross-track pixels, from ENVI header samples
     fov_deg: float            # lens FOV, user parameter (different lenses exist)
     principal_sample: float | None = None  # default center: (samples - 1) / 2
@@ -204,7 +204,7 @@ def sample_view_angles(sensor: PushbroomSensor) -> np.ndarray:
     """Return cross-track view angle per sample in radians.
     Center sample ≈ 0; left/right cover ±fov/2. If flip_samples=True, reverse sign.
     
-    FOV is a required parameter because PIKA-L can have different lenses.
+    FOV is a required parameter because hyperspectral sensors can have different lenses.
     """
     # Determine principal sample (center of the sensor)
     principal = sensor.principal_sample
@@ -316,11 +316,11 @@ def flat_ground_grid(
     R_enu_from_camera = R_enu_from_imu(t) · R_imu_from_camera(boresight).
     
     Important caveats to document in docstrings/comments:
-    - FOV is a required parameter because PIKA-L can have different lenses.
-    - `ground_alt` is a flat plane; this is an MVP before DEM.
-    - Roll/pitch/yaw convention may need calibration/sign flips depending on IMU export.
-    - This computes geolocation arrays only; it does not resample imagery.
-    """
+        - FOV is a required parameter because hyperspectral sensors can have different lenses.
+        - `ground_alt` is a flat plane; this is an MVP before DEM.
+        - Roll/pitch/yaw convention may need calibration/sign flips depending on IMU export.
+        - This computes geolocation arrays only; it does not resample imagery.
+        """
     # Fail fast with a clear message if pymap3d is missing, instead of
     # surfacing the failure as "No valid geolocation points found in grid".
     if enu2geodetic is None:
@@ -716,10 +716,10 @@ def write_flat_geotiff(
     time_offset_s: float = 0.0,
     footprint_path: str | Path | None = None,
 ) -> GeorefResult:
-    """Write a flat-earth georeferenced GeoTIFF from a PIKA-L raw cube.
+    """Write a flat-earth georeferenced GeoTIFF from a hyperspectral raw cube.
 
     MVP assumptions:
-    - FOV is user-provided because PIKA-L lenses differ.
+    - FOV is user-provided because hyperspectral sensor lenses differ.
     - ground_alt is a flat plane; when dem_path is provided, it's used for DEM-aware georeferencing.
     - uses geolocation arrays from P3.7a; orientation may need calibration.
     

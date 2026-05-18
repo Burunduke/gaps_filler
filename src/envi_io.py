@@ -1,6 +1,6 @@
 """
 Thin wrapper around spectral.io.envi.read_envi_header to extract ENVI .hdr metadata
-for hyperspectral cubes (PIKA-L .bil + .hdr).
+for hyperspectral cubes (.bil + .hdr).
 
 This module provides a simplified interface to read ENVI header files with proper
 type conversion and error handling. The spectral package is an optional dependency

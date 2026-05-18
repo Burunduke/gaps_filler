@@ -1,6 +1,6 @@
 # Hyperspectral gaps filler
 
-Плагин QGIS 3 для подготовки ортофотопланов из гиперспектральных снимков с дрона **PIKA-L** и заполнения пропусков (NoData) в растрах. Работает как Processing-провайдер: все алгоритмы появляются в *Processing Toolbox → Hyperspectral gaps filler → Raster analysis*.
+Плагин QGIS 3 для подготовки ортофотопланов из гиперспектральных снимков с дрона с интеграцией GPS/IMU и заполнения пропусков (NoData) в растрах. Работает как Processing-провайдер: все алгоритмы появляются в *Processing Toolbox → Hyperspectral gaps filler → Raster analysis*.
 
 Имя плагина: **Hyperspectral gaps filler**, версия **0.2** (см. [`metadata.txt`](metadata.txt:1)).
 
@@ -25,9 +25,9 @@
 |---|---|---|
 | `scipy` | Морфологическое закрытие пропусков (`MAX_INTERIOR_GAP_PX`), сегментация дыр, веса по расстоянию для мозаики v2. Есть pure-numpy fallback там, где возможно. | `pip install scipy` |
 | `scikit-image` | Метрика SSIM в *Mosaic quality*. | `pip install scikit-image` |
-| `pymap3d` | Преобразования ENU↔geodetic в стадии raw-привязки PIKA-L ([`airborne_georef.py`](airborne_georef.py:1)). | `pip install pymap3d` |
+| `pymap3d` | Преобразования ENU↔geodetic в стадии raw-привязки гиперспектральной камеры ([`airborne_georef.py`](airborne_georef.py:1)). | `pip install pymap3d` |
 | `pyproj` | Перепроецирование DEM в DEM-aware raw-привязке. QGIS обычно поставляет `pyproj` сам — отдельной установки часто не требуется. | `pip install pyproj` |
-| `spectral` | Чтение ENVI `.hdr` сайдкаров PIKA-L ([`envi_io.py`](envi_io.py:1)). | `pip install spectral` |
+| `spectral` | Чтение ENVI `.hdr` сайдкаров гиперспектральной камеры ([`envi_io.py`](envi_io.py:1)). | `pip install spectral` |
 
 ---
 
@@ -37,19 +37,19 @@
 
 ### 1. Filter bad frames — `gapsfiller:frame_filter`
 
-Реализован в [`frame_filter_algorithm.py`](frame_filter_algorithm.py:1). Прогоняет эвристику отбраковки PIKA-L по входным растрам и копирует «выживших» в указанную папку; в журнал и (опционально) в отчёт пишутся причины отбраковки. Используйте, когда нужно вручную просмотреть отбракованные перед мозаицированием.
+Реализован в [`frame_filter_algorithm.py`](frame_filter_algorithm.py:1). Прогоняет эвристику отбраковки гиперспектральной камеры по входным растрам и копирует «выживших» в указанную папку; в журнал и (опционально) в отчёт пишутся причины отбраковки. Используйте, когда нужно вручную просмотреть отбракованные перед мозаицированием.
 
 - **Inputs:** `INPUT_LAYERS` (список растров).
 - **Outputs:** `OUTPUT_FOLDER` (папка с принятыми кадрами), `REPORT` (опц. `.txt`).
 - **Ключевые опции:** `FRAME_FILTER_METHOD` (`v1_hard_thresholds` по умолчанию, `v2_adaptive_mad`, `v3_per_band`); `THRESHOLD_PRESET` (Custom / Permissive / Default / Strict); восемь raw-порогов (`SKEW_MAX`, `AREA_LO`, `AREA_HI`, `ASPECT_MAX`, `CENTRE_WINDOW`, `MIN_VALID_FRACTION`, `STD_MIN`, `SATURATION_FRACTION`); v2-параметр `K_MAD`; v3-параметры `MAX_DROPOUT_FRAC`, `MAX_STRIPE_RATIO`. Все «специфичные для метода» порядки спрятаны под Advanced parameters.
 
-### 2. Airborne georeference (raw PIKA-L) — `gapsfiller:airborne_georef`
+### 2. Airborne georeference (raw hyperspectral) — `gapsfiller:airborne_georef`
 
-Реализован в [`airborne_georef_algorithm.py`](airborne_georef_algorithm.py:1). Превращает сырой `.bil`-куб PIKA-L и сайдкары `.lcf` / `.times` в один георетированный GeoTIFF. Поддерживает плоскую землю (`GROUND_ALT`) и DEM-aware вариант (если задан DEM). Используйте перед фильтром, когда на входе сырые pushbroom-кадры без геопривязки.
+Реализован в [`airborne_georef_algorithm.py`](airborne_georef_algorithm.py:1). Превращает сырой `.bil`-куб гиперспектральной камеры и сайдкары `.lcf` / `.times` в один георетированный GeoTIFF. Поддерживает плоскую землю (`GROUND_ALT`) и DEM-aware вариант (если задан DEM). Используйте перед фильтром, когда на входе сырые pushbroom-кадры без геопривязки.
 
 - **Inputs:** `BIL` (raw cube), опционально `HDR` / `TIMES` / `LCF` (auto-discovered), `DEM` (опц.).
 - **Outputs:** `OUTPUT` (GeoTIFF), `OUTPUT_FOOTPRINT` (опц. вектор `<output>.footprint.geojson` — см. ниже).
-- **Ключевые опции:** `FOV_DEG` (обязательный — линзы PIKA-L различаются), `GROUND_ALT`, `DST_CRS` (по умолчанию EPSG:4326), `RESOLUTION`, `NODATA`; advanced — boresight `BORESIGHT_ROLL_DEG` / `BORESIGHT_PITCH_DEG` / `BORESIGHT_YAW_DEG` и `TIME_OFFSET_S` для калибровки.
+- **Ключевые опции:** `FOV_DEG` (обязательный — линзы гиперспектральных камер различаются), `GROUND_ALT`, `DST_CRS` (по умолчанию EPSG:4326), `RESOLUTION`, `NODATA`; advanced — boresight `BORESIGHT_ROLL_DEG` / `BORESIGHT_PITCH_DEG` / `BORESIGHT_YAW_DEG` и `TIME_OFFSET_S` для калибровки.
 
 ### 3. Mosaic frames — `gapsfiller:mosaic_frames`
 
@@ -143,7 +143,7 @@
 
 - Стадия мозаицирования требует одинаковой CRS и pixel size у всех входов. Включите `REPROJECT_TO_FIRST=True` для автоматического перепроецирования к первому входу (билинейная интерполяция).
 - Перекрытия в мозаике разрешаются по правилам соответствующего метода (`v1` — первый записал; `v2` — пиксель из кадра, дальше всего от своего края; `v3` — приоритет наивысшего разрешения через `gdalbuildvrt`). Спектрального смешивания нет ни в одном из методов — это сознательный выбор (см. «Spectral-fidelity policy»).
-- Эвристика отбраковки рассчитана на кадры PIKA-L; для других сенсоров пороги, скорее всего, придётся подбирать заново.
+- Эвристика отбраковки рассчитана на кадры гиперспектральной камеры; для других сенсоров пороги, скорее всего, придётся подбирать заново.
 - Автоматических тестов в проекте нет (по решению поддерживающих).
 
 ---

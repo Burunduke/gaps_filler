@@ -1,8 +1,8 @@
 """
-Passive data containers for PIKA-L flight line files.
+Passive data containers for hyperspectral flight line files.
 
 This module provides dataclasses that bundle paths to the files describing
-a PIKA-L flight line. These are passive containers — they do NOT perform
+a hyperspectral flight line. These are passive containers — they do NOT perform
 any I/O operations. File reading logic lives in separate modules like envi_io.
 """
 
@@ -13,7 +13,7 @@ from typing import Optional, Union
 
 @dataclass(frozen=True)
 class FlightLineMeta:
-    """Paths to the four files describing one PIKA-L flight line.
+    """Paths to the four files describing one hyperspectral flight line.
 
     Passive container — does NOT read files. I/O lives elsewhere
     (see envi_io.read_envi_header, airborne_georef in P3).
@@ -25,14 +25,14 @@ class FlightLineMeta:
     lcf: Optional[Path]       # per-line nav (lat/lon/alt + roll/pitch/yaw + time)
 
 
-# PIKA-L typical band count
-DEFAULT_PIKA_L_BANDS = 280
+# Hyperspectral typical band count
+DEFAULT_HYPERSPECTRAL_BANDS = 280
 
 
 def discover_flight_line(bil_path: Union[str, Path]) -> FlightLineMeta:
     """Given path to a .bil/.bip/.bsq, find sibling .hdr/.times/.lcf files.
     
-    Supports both naming conventions:
+    Supports naming conventions:
     - HDR: <bil_path>.hdr (e.g. foo.bil.hdr), with fallback to <basename>.hdr
     - TIMES: <bil_path>.times (e.g. foo.bil.times), with fallback to <basename>.times
     - LCF: <basename>.lcf (e.g. foo.lcf), with fallback to <bil_path>.lcf

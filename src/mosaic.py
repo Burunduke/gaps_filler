@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Stage B of the hyperspectral pipeline.
 
-Mosaic a list of already-filtered, georeferenced PIKA-L GeoTIFF frames
+Mosaic a list of already-filtered, georeferenced hyperspectral GeoTIFF frames
 into a single tiled BigTIFF, processed band-by-band to keep memory
 bounded. Output is ``float32`` with ``NaN`` as NoData. The active
 mosaic method is selected at the call site via

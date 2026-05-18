@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Processing algorithm wrapper around :mod:`airborne_georef`.
 
-Exposes the raw PIKA-L cube georeferencing functionality as a standalone
+Exposes the raw hyperspectral cube georeferencing functionality as a standalone
 QGIS Processing algorithm. Wraps :func:`airborne_georef.write_flat_geotiff`
-so users can run raw PIKA-L → georeferenced GeoTIFF from the QGIS toolbox.
+so users can run raw hyperspectral → georeferenced GeoTIFF from the QGIS toolbox.
 """
 
 import os
@@ -37,7 +37,7 @@ def _is_empty_output(raw):
 
 
 class AirborneGeorefAlgorithm(QgsProcessingAlgorithm):
-    """Georeference raw PIKA-L flight line cubes to GeoTIFF."""
+    """Georeference raw hyperspectral flight line cubes to GeoTIFF."""
 
     BIL = "BIL"
     HDR = "HDR"
@@ -78,7 +78,7 @@ class AirborneGeorefAlgorithm(QgsProcessingAlgorithm):
 
     def shortHelpString(self):
         return self.tr(
-            "Georeferences a raw PIKA-L flight line cube to a GeoTIFF using "
+            "Georeferences a raw hyperspectral flight line cube to a GeoTIFF using "
             "navigation data from .lcf and .times sidecar files. Supports "
             "both flat-earth and DEM-aware georeferencing modes.\n\n"
             "Inputs:\n"
@@ -103,7 +103,7 @@ class AirborneGeorefAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterRasterLayer(
                 self.BIL,
-                self.tr("Raw PIKA-L cube (.bil/.bip/.bsq)"),
+                self.tr("Raw hyperspectral cube (.bil/.bip/.bsq)"),
                 optional=False
             )
         )
@@ -466,7 +466,7 @@ class AirborneGeorefAlgorithm(QgsProcessingAlgorithm):
         
         # Attach RGB post-processor for better visualization
         # Try to get band count from the result or default to a reasonable value
-        band_count = getattr(result, 'bands', models.DEFAULT_PIKA_L_BANDS)  # PIKA-L typical band count
+        band_count = getattr(result, 'bands', models.DEFAULT_HYPERSPECTRAL_BANDS)  # Typical hyperspectral band count
         self._rgb_post_processor = canvas_styling.attach_rgb_post_processor_if_needed(
             context, out_path, band_count)
         
